@@ -17,9 +17,11 @@ Claude Code  ──stdio──▶  warden_mcp_proxy.py  ──HTTP/SSE──▶ 
 
 Two problems make the naive version impossible, and most of the code exists to solve them.
 
-**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threads by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event, `_process_commands` is registered with `register_slate_post_tick_callback` and drains that list **on the game thread**, writes the outcome to a result store, and signals the waiter. The HTTP thread then serialises the result. Every one of the 20 tools goes through this path.
+**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threaded by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event for up to 30 seconds, `_process_commands` runs **on the game thread** via `register_slate_post_tick_callback`, takes one command per tick, writes the outcome to a result store and signals the waiter. The HTTP thread then serialises the result. Every one of the 20 tools goes through this path, and a caller that never gets signalled gets a timeout rather than a hung socket.
 
-**Claude Code speaks stdio MCP, and UE5 cannot own stdin.** The editor is a long-lived GUI process; it has no stdio channel to hand to an MCP client. So a thin proxy sits in between. The part that matters: the proxy answers `initialize` and `tools/list` **locally, from a static table**, and only forwards `tools/call` over HTTP. The practical effect is that the toolset shows up in the client even when Unreal is closed, and starting the editor is enough to make the tools live. Without this, the client would fail its handshake whenever the editor was not already running.
+That same tick callback also drives the game simulation, the camera, unit movement and the in-editor play layer. Each of those is wrapped in its own `try/except` for a reason that cost a debugging session: one unhandled exception anywhere in the chain makes Unreal drop the entire slate callback, silently, and everything downstream stops ticking with no error in the log.
+
+**Claude Code speaks stdio MCP, and UE5 cannot own stdin.** The editor is a long-lived GUI process; it has no stdio channel to hand to an MCP client. So a thin proxy sits in between. The part that matters: the proxy answers `initialize` and `tools/list` **locally, from a static table**, swallows notifications, and forwards everything else, `tools/call` included, over HTTP. The practical effect is that the toolset shows up in the client even when Unreal is closed, and starting the editor is enough to make those tools callable. Without this, the client would fail its initialization handshake whenever the editor was not already running.
 
 ## Tools
 
@@ -61,6 +63,18 @@ The rules live on the server, not in the prompt. `build_building` refuses a plac
 
 Beyond the MCP surface, `init_unreal.py` carries a Play-In-Editor RTS layer driven by the same tick callbacks: an orbiting strategy camera, build mode with a ghost preview and rotation snapping, click-drag road drawing, unit selection and move orders, and an on-screen hint line. It is the part that makes the world an agent builds actually playable.
 
+## Layout
+
+```
+Content/Python/init_unreal.py   MCP server, tool registry, thread bridge, PIE layer.
+                                Unreal runs any init_unreal.py automatically at startup.
+Content/Python/warden_game.py   Domain model imported by the server: building and unit
+                                definitions, costs, resource and population state, and
+                                the production rules the game tools enforce.
+proxy/warden_mcp_proxy.py       stdio to HTTP bridge for the MCP client.
+proxy/warden_mcp.cmd            Launcher, runs the bridge on Unreal's bundled Python.
+```
+
 ## Install
 
 1. Enable **Python Editor Script Plugin** in your UE5 project.
@@ -77,13 +91,19 @@ Beyond the MCP surface, `init_unreal.py` carries a Play-In-Editor RTS layer driv
 }
 ```
 
-4. Open the project. The editor log prints the server start line, and `get_project_info` should answer.
+4. Open the project. The editor log should show:
+
+```
+[Warden MCP] v3 ready -> http://127.0.0.1:9876/mcp
+```
+
+`get_project_info` should now answer from your MCP client.
 
 Edit `UE_PYTHON` in `warden_mcp.cmd` if your engine is not at the default 5.8 path.
 
 ## Known limitations
 
-- **The proxy's static tool table lists the 11 editor tools only.** The 9 game tools execute correctly when called, since `tools/call` is forwarded verbatim, but they are not advertised in `tools/list`. The two tables want merging or generating from one source.
+- **The proxy's static tool table lists the 11 editor tools only.** The server generates its own `tools/list` from the `TOOLS` registry, so it advertises all 20; the proxy's copy is hand-maintained and has drifted. The 9 game tools still execute correctly when called, since `tools/call` is forwarded verbatim, but a client that trusts the proxy's list will not know they exist. The two want generating from one source.
 - **No authentication.** The server binds `127.0.0.1:9876` and trusts every caller. `run_python` executes arbitrary code in the editor process, so this is a local development tool and nothing else. Do not expose the port.
 - **Windows paths** are assumed in the launcher.
 - **Code comments are in Turkish.** The tool descriptions, schemas and this document are in English.

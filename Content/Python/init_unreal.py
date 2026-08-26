@@ -1002,6 +1002,64 @@ def tool_combat_setup_pool(a):
     unreal.EditorLevelLibrary.save_current_level()
     return {"created": len(yeni), "existing": len(mevcut), "total": len(mevcut) + len(yeni)}
 
+_UNIT_SLOT_PREFIX = "WARDEN_UnitSlot_"
+
+def tool_unit_pool_setup(a):
+    """Editor'de gizli ASKER slot havuzu: PIE icinde T tusu bunlari aktifler
+    (PIE calisirken editor dunyasina spawn olmadigi icin havuz sart)."""
+    if _pie_world() is not None:
+        raise Exception("PIE acikken kurulamaz; once Play'i durdur")
+    count = int(a.get("count", 12))
+    mesh = unreal.load_asset("/Game/Warden/Units/SM_Villager2")
+    kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
+    mevcut = {ac.get_actor_label() for ac in unreal.EditorLevelLibrary.get_all_level_actors()
+              if ac.get_actor_label().startswith(_UNIT_SLOT_PREFIX)}
+    yeni = 0
+    for i in range(count):
+        lbl = f"{_UNIT_SLOT_PREFIX}{i:02d}"
+        if lbl in mevcut:
+            continue
+        ac = unreal.EditorLevelLibrary.spawn_actor_from_class(
+            kls, unreal.Vector(-44000, -40000 + i * 300, 0), unreal.Rotator(0, 0, 0))
+        if not ac:
+            continue
+        ac.set_actor_label(lbl)
+        ac.set_folder_path("Warden/Combat")
+        comps = ac.get_components_by_class(unreal.StaticMeshComponent)
+        if comps:
+            comps[0].set_mobility(unreal.ComponentMobility.MOVABLE)
+            if mesh:
+                comps[0].set_static_mesh(mesh)
+        ac.set_actor_hidden_in_game(True)
+        yeni += 1
+    unreal.EditorLevelLibrary.save_current_level()
+    return {"created": yeni, "existing": len(mevcut), "total": len(mevcut) + yeni}
+
+def _pie_unit_slot(w):
+    """PIE'de bos asker slotu (aktiflenen slotun etiketi degistigi icin
+    prefix'i hala tasiyanlar bostur)."""
+    pool = _combat.get("uslots")
+    if not pool:
+        pool = []
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.StaticMeshActor):
+                try:
+                    if a.get_actor_label().startswith(_UNIT_SLOT_PREFIX):
+                        pool.append(a)
+                except Exception:
+                    pass
+            pool.sort(key=lambda a: a.get_actor_label())
+        except Exception:
+            pass
+        _combat["uslots"] = pool
+    for a in pool:
+        try:
+            if unreal.SystemLibrary.is_valid(a) and a.get_actor_label().startswith(_UNIT_SLOT_PREFIX):
+                return a
+        except Exception:
+            pass
+    return None
+
 def _combat_town():
     """TownHall kaydi (x, y, hp)."""
     if wg is None:
@@ -1238,9 +1296,11 @@ def _combat_tick(w, dt):
         _combat["hud_t"] = 0.5
         if st["phase"] == "fighting":
             _pie["hint"] = (f"DALGA {st['wave']}  Dusman:{len(st['enemies'])}  "
-                            f"Kale:{int(st['town_hp'])}/{int(st['town_hp_max'])}")
+                            f"Kale:{int(st['town_hp'])}/{int(st['town_hp_max'])}"
+                            f"  [T:asker  koylu sec+M:milis]")
         elif st["phase"] == "grace":
-            _pie["hint"] = f"Sonraki dalga: {int(st.get('grace_left', 0))} sn  [N: hemen baslat]"
+            _pie["hint"] = (f"Sonraki dalga: {int(st.get('grace_left', 0))} sn"
+                            f"  [N:hemen  T:asker  koylu sec+M:milis]")
 
 # ── ASSET ARACLARI (bul / tani / gor / materyal / kopyala-sil) ────────────────
 
@@ -1442,6 +1502,7 @@ TOOLS = {
     "create_material_instance": {"desc": "Create a MaterialInstanceConstant from a parent with scalar/vector/texture parameter overrides, saved to disk.", "fn": tool_create_material_instance, "schema": {"type":"object","properties":{"parent":{"type":"string"},"name":{"type":"string"},"folder":{"type":"string","description":"Default /Game/Warden/Materials"},"scalar_params":{"type":"object"},"vector_params":{"type":"object","description":"name -> [r,g,b] or [r,g,b,a]"},"texture_params":{"type":"object","description":"name -> texture asset path"}},"required":["parent","name"]}},
     "asset_ops":          {"desc": "Asset file operations: op = duplicate | rename | delete | exists. duplicate/rename need new_path.", "fn": tool_asset_ops, "schema": {"type":"object","properties":{"op":{"type":"string"},"asset_path":{"type":"string"},"new_path":{"type":"string"}},"required":["op","asset_path"]}},
     "combat_setup_pool":  {"desc": "One-time editor setup: create the hidden enemy actor pool (copied into PIE). Run once before the first wave.", "fn": tool_combat_setup_pool, "schema": {"type":"object","properties":{"count":{"type":"integer","description":"Pool size, default 24"}}}},
+    "unit_pool_setup":    {"desc": "One-time editor setup: hidden soldier slot pool that the in-game T key activates (editor Python cannot spawn into a running PIE).", "fn": tool_unit_pool_setup, "schema": {"type":"object","properties":{"count":{"type":"integer","description":"Pool size, default 12"}}}},
     "combat_start":       {"desc": "Start the bandit-wave defense loop (Faz A core). wave defaults to 1; radius shrinks spawn distance for quick tests (default 9000).", "fn": tool_combat_start, "schema": {"type":"object","properties":{"wave":{"type":"integer"},"radius":{"type":"number"}}}},
     "combat_status":      {"desc": "Live combat state: phase, wave, enemies left, TownHall hp, kills, gold earned, unit hp.", "fn": tool_combat_status, "schema": {"type":"object","properties":{}}},
     "combat_stop":        {"desc": "Stop the combat loop and release enemy actors.", "fn": tool_combat_stop, "schema": {"type":"object","properties":{}}},
@@ -2184,11 +2245,14 @@ def _pie_tick(dt):
                 unreal.log(f"[PIE] age replay err: {e}")
         # savas temizligi: PIE aktoru referanslari oldu, birim canlari tazelenir;
         # milis donusumu geciciydi, duser. Biten savas (won/lost) tamamen sifirlanir.
-        if _combat.get("unit_hp") or _combat.get("slot_map") or _combat.get("militia"):
+        if (_combat.get("unit_hp") or _combat.get("slot_map") or _combat.get("militia")
+                or _combat.get("uslots") or _combat.get("uspawn_i")):
             _combat["slot_map"] = {}
             _combat["slots"] = None
             _combat["gz"] = {}
             _combat["unit_hp"] = {}
+            _combat["uslots"] = None
+            _combat["uspawn_i"] = 0
             _combat.setdefault("militia", set()).clear()
             _combat.setdefault("auto_orders", set()).clear()
             _combat["over_msg"] = False
@@ -2298,6 +2362,50 @@ def _pie_tick(dt):
                             _pie_hint(w, f"Savas baslamadi: {e}", 3.0)
                     elif stc["phase"] == "grace":
                         stc["grace_left"] = 0.1
+            elif _pie_key_edge(0x54):  # T: kisladan asker bas (gecici savas birimi)
+                if wg is not None:
+                    bar = next((b for b in wg.placed_buildings
+                                if isinstance(b, dict) and b.get("type") == "Barracks"), None)
+                    sdef = wg.UNIT_DEFS.get("Soldier", {})
+                    if bar is None:
+                        _pie_hint(w, "Kisla yok! Once B ile insa modundan Barracks kur.", 3.0)
+                    else:
+                        ok, msg = wg.spend(sdef.get("cost", {}))
+                        if not ok:
+                            cst = " ".join(f"{k}:{v}" for k, v in sdef.get("cost", {}).items())
+                            _pie_hint(w, f"OLMAZ: {msg}  (Asker bedeli: {cst})", 2.5)
+                        else:
+                            slot = _pie_unit_slot(w)
+                            if slot is None:
+                                wg.earn(sdef.get("cost", {}))
+                                _pie_hint(w, "Asker havuzu dolu (en fazla 12 gecici asker).", 2.5)
+                            else:
+                                import math as _m
+                                idx = _combat.get("uspawn_i", 0)
+                                _combat["uspawn_i"] = idx + 1
+                                ang = _m.radians(idx * 47.0)
+                                ux = float(bar["x"]) + 750 * _m.cos(ang)
+                                uy = float(bar["y"]) + 750 * _m.sin(ang)
+                                gz = _pie_ground(w, ux, uy)
+                                lbl = f"WARDEN_Unit_Soldier_S{idx:02d}"
+                                try:
+                                    slot.set_actor_label(lbl)
+                                    comps = slot.get_components_by_class(unreal.StaticMeshComponent)
+                                    mm = _pie_asset("/Game/Warden/Units/MI_WardenSoldier")
+                                    mz = 0.0
+                                    if comps:
+                                        if mm:
+                                            for si in range(comps[0].get_num_materials()):
+                                                comps[0].set_material(si, mm)
+                                        if comps[0].static_mesh:
+                                            mb = comps[0].static_mesh.get_bounds()
+                                            mz = mb.origin.z - mb.box_extent.z
+                                    slot.root_component.set_mobility(unreal.ComponentMobility.MOVABLE)
+                                    slot.set_actor_location(unreal.Vector(ux, uy, gz - mz), False, False)
+                                    slot.set_actor_hidden_in_game(False)
+                                except Exception:
+                                    pass
+                                _pie_hint(w, f"ASKER HAZIR (kisla onunde). Sec + SagTik ile yonet.", 2.5)
             elif _pie_key_edge(0x4D):  # M: secili koyluyu milise donustur (gecici)
                 sel = _pie["sel"]
                 mil = _combat.setdefault("militia", set())

@@ -498,18 +498,30 @@ def _job_start(name, gen_factory):
     _jobs[jid] = j
     return jid
 
+_jobs_ticking = False
+
 def _jobs_tick():
-    for j in list(_jobs.values()):
-        if j["state"] != "running":
-            continue
-        try:
-            next(j["gen"])
-        except StopIteration as e:
-            j["state"] = "done"
-            j["result"] = getattr(e, "value", None)
-        except Exception as ex:
-            j["state"] = "error"
-            j["result"] = str(ex)
+    # Reentrancy bekcisi: bazi unreal cagrilari (screenshot, viewport) slate
+    # tick'ini ICERIDEN pompalar; bekci olmadan ayni generator'a ust uste
+    # next() gider ("generator already executing", 2026-08-26'da canli yakalandi).
+    global _jobs_ticking
+    if _jobs_ticking:
+        return
+    _jobs_ticking = True
+    try:
+        for j in list(_jobs.values()):
+            if j["state"] != "running":
+                continue
+            try:
+                next(j["gen"])
+            except StopIteration as e:
+                j["state"] = "done"
+                j["result"] = getattr(e, "value", None)
+            except Exception as ex:
+                j["state"] = "error"
+                j["result"] = str(ex)
+    finally:
+        _jobs_ticking = False
 
 def tool_job_status(a):
     jid = a.get("job_id")
@@ -530,6 +542,53 @@ def _screenshot_path(name):
     base = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir())
     return os.path.join(base, "Screenshots", "WindowsEditor", name)
 
+def _bring_editor_front():
+    """Editor penceresini one getir. Arka planda render durur ve screenshot
+    DOSYA URETMEZ (ini/cvar denemeleri kesmedi); cekim oncesi bu cagrilir.
+    Minimize pencereye DOKUNMAZ (restore PIE'de SlateCore cokmesi yapmisti)."""
+    try:
+        import ctypes
+        pid = os.getpid()
+        found = []
+        CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _cb(hwnd, _lp):
+            p = ctypes.c_ulong(0)
+            _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid and _u32.IsWindowVisible(hwnd):
+                ln = _u32.GetWindowTextLengthW(hwnd)
+                if ln > 3:
+                    buf = ctypes.create_unicode_buffer(ln + 1)
+                    _u32.GetWindowTextW(hwnd, buf, ln + 1)
+                    if "Unreal Editor" in buf.value:
+                        found.append(hwnd)
+            return True
+        _u32.EnumWindows(CB(_cb), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        if _u32.IsIconic(hwnd):
+            return False
+        if _u32.GetForegroundWindow() == hwnd:
+            return True
+        # foreground kilidi: onde kim varsa onun input kuyruguna baglan, sonra gec
+        k32 = ctypes.windll.kernel32
+        fg = _u32.GetForegroundWindow()
+        fg_tid = _u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        our_tid = k32.GetCurrentThreadId()
+        if fg_tid and fg_tid != our_tid:
+            _u32.AttachThreadInput(our_tid, fg_tid, True)
+        try:
+            _u32.BringWindowToTop(hwnd)
+            ok = bool(_u32.SetForegroundWindow(hwnd))
+            if not ok:
+                _u32.SwitchToThisWindow(hwnd, True)
+        finally:
+            if fg_tid and fg_tid != our_tid:
+                _u32.AttachThreadInput(our_tid, fg_tid, False)
+        return _u32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
 def _gen_wait_file(path, timeout, log):
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -538,6 +597,33 @@ def _gen_wait_file(path, timeout, log):
             return {"path": path, "size_kb": os.path.getsize(path) // 1024}
         yield
     raise Exception(f"Dosya {timeout} sn icinde olusmadi: {path}")
+
+def _scene_capture_png(world, loc, rot, name, w=1280, h=720, fov=90.0):
+    """Viewport'tan bagimsiz screenshot: SceneCapture2D -> RenderTarget -> PNG.
+    Editor arka planda/odaksizken de calisir (HighResShot orada dosya uretmez)."""
+    rt = unreal.RenderingLibrary.create_render_target2d(
+        world, int(w), int(h), unreal.TextureRenderTargetFormat.RTF_RGBA8)
+    kls = unreal.load_class(None, "/Script/Engine.SceneCapture2D")
+    cap = unreal.EditorLevelLibrary.spawn_actor_from_class(kls, loc, rot)
+    if not cap:
+        raise Exception("SceneCapture2D spawn olmadi")
+    try:
+        cc = cap.capture_component2d
+        cc.set_editor_property("texture_target", rt)
+        cc.set_editor_property("fov_angle", float(fov))
+        cc.set_editor_property("capture_source", unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR)
+        cc.capture_scene()
+        out_dir = os.path.dirname(_screenshot_path(name))
+        unreal.RenderingLibrary.export_render_target(world, rt, out_dir, name)
+        p = os.path.join(out_dir, name)
+        if not os.path.isfile(p):
+            raise Exception(f"Export dosya uretmedi: {p}")
+        return p
+    finally:
+        try:
+            unreal.EditorLevelLibrary.destroy_actor(cap)
+        except Exception:
+            pass
 
 def tool_screenshot(a):
     name = a.get("name", "warden_shot.png")
@@ -549,17 +635,31 @@ def tool_screenshot(a):
             os.remove(path)
     except Exception:
         pass
-    unreal.AutomationLibrary.take_high_res_screenshot(
-        int(a.get("width", 1280)), int(a.get("height", 720)), name)
-    jid = _job_start("screenshot", lambda log: _gen_wait_file(path, 15.0, log))
-    return {"path": path, "job": jid,
-            "note": "Cekim sonraki karelerde yazilir; job_status(job) 'done' olunca dosyayi oku."}
+    w, h = int(a.get("width", 1280)), int(a.get("height", 720))
+    mode = a.get("mode", "auto")  # auto | viewport | capture
+    fg = _bring_editor_front() if mode != "capture" else False
+    if mode == "viewport" or (mode == "auto" and fg):
+        unreal.AutomationLibrary.take_high_res_screenshot(w, h, name)
+        jid = _job_start("screenshot", lambda log: _gen_wait_file(path, 15.0, log))
+        return {"path": path, "job": jid, "method": "viewport", "foreground": fg,
+                "note": "Cekim sonraki karelerde yazilir; job_status(job) 'done' olunca dosyayi oku."}
+    # odak alinamadi veya capture istendi: viewport kamera pozundan aninda capture
+    world = _pie_world() or unreal.EditorLevelLibrary.get_editor_world()
+    try:
+        cam = unreal.EditorLevelLibrary.get_level_viewport_camera_info()
+        loc, rot = cam[0], cam[1]
+    except Exception:
+        loc, rot = unreal.Vector(0, 0, 3000), unreal.Rotator(0, -55, 0)
+    p = _scene_capture_png(world, loc, rot, name, w, h)
+    return {"path": p, "method": "scene_capture", "foreground": fg,
+            "note": "Dosya hazir, hemen okunabilir (job yok)."}
 
 def tool_run_python_out(a):
     """run_python'in guvenilir hali: stdout + result + traceback her zaman doner."""
     import io, contextlib, traceback
     buf = io.StringIO()
-    lv = {"unreal": unreal, "wg": wg, "result": None}
+    # srv = sunucu modul namespace'i (TOOLS, _pie, yardimcilar); escape hatch tam yetkili
+    lv = {"unreal": unreal, "wg": wg, "srv": globals(), "result": None}
     try:
         with contextlib.redirect_stdout(buf):
             exec(compile(a["code"], "<warden_out>", "exec"), lv)
@@ -575,6 +675,8 @@ def tool_run_python_out(a):
 
 def _gen_pie_smoke(seconds, shot_name, log):
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    if _bring_editor_front():
+        log("editor one getirildi")
     les.editor_request_begin_play()
     log("PIE istendi")
     t0 = time.monotonic()
@@ -597,6 +699,16 @@ def _gen_pie_smoke(seconds, shot_name, log):
     t2 = time.monotonic()
     while time.monotonic() - t2 < 8.0 and not os.path.isfile(path):
         yield
+    if not os.path.isfile(path):
+        # editor odaksiz -> viewport cizilmiyor; oyuncu kamerasindan scene capture
+        try:
+            w2 = _pie_world()
+            pcm = unreal.GameplayStatics.get_player_camera_manager(w2, 0)
+            path = _scene_capture_png(w2, pcm.get_camera_location(),
+                                      pcm.get_camera_rotation(), "sc_" + shot_name)
+            log("scene capture fallback kullanildi")
+        except Exception as e:
+            log(f"scene capture fallback hatasi: {e}")
     report = {
         "pie_started": True,
         "ran_seconds": seconds,
@@ -820,6 +932,165 @@ def tool_save_all(a):
     ok = unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
     return {"saved": bool(ok)}
 
+# ── ASSET ARACLARI (bul / tani / gor / materyal / kopyala-sil) ────────────────
+
+def tool_find_assets(a):
+    """Content Browser'da isimle asset ara (asset registry, yukleme yapmaz)."""
+    q = (a.get("query") or "").lower()
+    cls = (a.get("class_filter") or "").lower()
+    root = a.get("path", "/Game")
+    limit = int(a.get("limit", 50))
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    out = []
+    for ad in ar.get_assets_by_path(root, recursive=True) or []:
+        name = str(ad.asset_name)
+        if q and q not in name.lower():
+            continue
+        acls = str(ad.asset_class_path.asset_name)
+        if cls and cls != acls.lower():
+            continue
+        out.append({"name": name, "class": acls,
+                    "path": f"{ad.package_name}.{name}"})
+        if len(out) >= limit:
+            break
+    return {"assets": out, "count": len(out), "truncated": len(out) >= limit}
+
+def tool_asset_info(a):
+    """Asset kimligi: StaticMesh icin boyut/taban/slotlar/ucgen; MI icin parent."""
+    path = a["asset_path"]
+    obj = unreal.load_asset(path)
+    if not obj:
+        raise Exception(f"Asset yok: {path}")
+    info = {"path": path, "class": obj.get_class().get_name()}
+    if isinstance(obj, unreal.StaticMesh):
+        b = obj.get_bounds()
+        info["size_xyz"] = [round(b.box_extent.x * 2, 1), round(b.box_extent.y * 2, 1),
+                            round(b.box_extent.z * 2, 1)]
+        info["base_z_offset"] = round(b.origin.z - b.box_extent.z, 1)  # spawn_mesh bunu telafi eder
+        try:
+            info["triangles_lod0"] = obj.get_num_triangles(0)
+            info["lods"] = obj.get_num_lods()
+        except Exception:
+            pass
+        mats = []
+        for sm in obj.static_materials:
+            mi = sm.material_interface
+            mats.append({"slot": str(sm.material_slot_name),
+                         "material": mi.get_path_name() if mi else None})
+        info["material_slots"] = mats
+    elif isinstance(obj, unreal.MaterialInstance):
+        try:
+            p = obj.get_editor_property("parent")
+            info["parent"] = p.get_path_name() if p else None
+        except Exception:
+            pass
+    elif isinstance(obj, unreal.Texture2D):
+        try:
+            info["size_px"] = [obj.blueprint_get_size_x(), obj.blueprint_get_size_y()]
+        except Exception:
+            pass
+    return info
+
+_PREVIEW_SPOT = (0.0, -30000.0)  # koyden uzak bos nokta
+
+def tool_preview_asset(a):
+    """Asset'i gormek: uzak noktaya gecici koy, SceneCapture ile fotografla, sil.
+    Viewport kamerasina dokunmaz, odak gerektirmez, aninda doner."""
+    path = a["asset_path"]
+    mesh = unreal.load_asset(path)
+    if not isinstance(mesh, unreal.StaticMesh):
+        raise Exception(f"StaticMesh degil: {path}")
+    import math as _m
+    px, py = _PREVIEW_SPOT
+    gz = _ground_z(px, py)
+    b = mesh.get_bounds()
+    kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
+    ac = unreal.EditorLevelLibrary.spawn_actor_from_class(
+        kls, unreal.Vector(px, py, gz - (b.origin.z - b.box_extent.z)),
+        unreal.Rotator(0, 0, 0))
+    if not ac:
+        raise Exception("Preview spawn olmadi")
+    try:
+        ac.set_actor_label("WARDEN_PreviewTemp")
+        comps = ac.get_components_by_class(unreal.StaticMeshComponent)
+        if comps:
+            comps[0].set_mobility(unreal.ComponentMobility.MOVABLE)
+            comps[0].set_static_mesh(mesh)
+        size = max(b.box_extent.x, b.box_extent.y, b.box_extent.z)
+        d = size * 2.6 + 300.0
+        tz = gz + b.box_extent.z
+        cx, cy, cz = px - d * 0.707, py - d * 0.707, tz + d * 0.45
+        yaw = _m.degrees(_m.atan2(py - cy, px - cx))
+        pitch = -_m.degrees(_m.atan2(cz - tz, _m.hypot(px - cx, py - cy)))
+        name = "preview_" + "".join(c if c.isalnum() else "_" for c in path.split("/")[-1]) + ".png"
+        world = unreal.EditorLevelLibrary.get_editor_world()
+        # Rotator pozisyonel sira = (roll, pitch, yaw)!
+        shot = _scene_capture_png(world, unreal.Vector(cx, cy, cz),
+                                  unreal.Rotator(0.0, pitch, yaw), name, fov=60.0)
+        return {"screenshot": shot,
+                "size_xyz": [round(b.box_extent.x * 2, 1), round(b.box_extent.y * 2, 1),
+                             round(b.box_extent.z * 2, 1)],
+                "base_z_offset": round(b.origin.z - b.box_extent.z, 1)}
+    finally:
+        try:
+            unreal.EditorLevelLibrary.destroy_actor(ac)
+        except Exception:
+            pass
+
+def tool_create_material_instance(a):
+    """Parametreli MaterialInstanceConstant uret: scalar/vector/texture."""
+    parent = unreal.load_asset(a["parent"])
+    if not parent:
+        raise Exception(f"Parent materyal yok: {a['parent']}")
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    fac = unreal.MaterialInstanceConstantFactoryNew()
+    mi = at.create_asset(a["name"], a.get("folder", "/Game/Warden/Materials"),
+                         unreal.MaterialInstanceConstant, fac)
+    if not mi:
+        raise Exception("MI olusturulamadi (ayni isim var mi?)")
+    mi.set_editor_property("parent", parent)
+    mel = unreal.MaterialEditingLibrary
+    applied = {"scalar": [], "vector": [], "texture": []}
+    for k, v in (a.get("scalar_params") or {}).items():
+        mel.set_material_instance_scalar_parameter_value(mi, k, float(v))
+        applied["scalar"].append(k)
+    for k, v in (a.get("vector_params") or {}).items():
+        mel.set_material_instance_vector_parameter_value(
+            mi, k, unreal.LinearColor(float(v[0]), float(v[1]), float(v[2]),
+                                      float(v[3]) if len(v) > 3 else 1.0))
+        applied["vector"].append(k)
+    for k, v in (a.get("texture_params") or {}).items():
+        tex = unreal.load_asset(v)
+        if tex:
+            mel.set_material_instance_texture_parameter_value(mi, k, tex)
+            applied["texture"].append(k)
+    mel.update_material_instance(mi)
+    unreal.EditorAssetLibrary.save_loaded_asset(mi)
+    return {"created": mi.get_path_name(), "parent": a["parent"], "applied": applied}
+
+def tool_asset_ops(a):
+    """Asset dosya islemleri: duplicate / rename / delete / exists."""
+    op = a["op"]
+    src = a["asset_path"]
+    dst = a.get("new_path")
+    EAL = unreal.EditorAssetLibrary
+    if op == "exists":
+        return {"exists": bool(EAL.does_asset_exist(src))}
+    if not EAL.does_asset_exist(src):
+        raise Exception(f"Asset yok: {src}")
+    if op == "duplicate":
+        if not dst:
+            raise Exception("new_path gerek")
+        obj = EAL.duplicate_asset(src, dst)
+        return {"duplicated": obj.get_path_name() if obj else None}
+    if op == "rename":
+        if not dst:
+            raise Exception("new_path gerek")
+        return {"renamed": bool(EAL.rename_asset(src, dst)), "to": dst}
+    if op == "delete":
+        return {"deleted": bool(EAL.delete_asset(src))}
+    raise Exception(f"Bilinmeyen op: {op} (duplicate/rename/delete/exists)")
+
 TOOLS = {
     "get_project_info":   {"desc": "Get Warden project info and actor count.",       "fn": tool_get_project_info,  "schema": {"type":"object","properties":{}}},
     "get_all_actors":     {"desc": "List all actors in the current UE5 level.",       "fn": tool_get_all_actors,    "schema": {"type":"object","properties":{}}},
@@ -855,6 +1126,11 @@ TOOLS = {
     "merge_actors":       {"desc": "EXPERIMENTAL: merge labeled StaticMeshActors into one mesh asset (+ merged actor). Known quirk: result package gets SM_ prefix.", "fn": tool_merge_actors, "schema": {"type":"object","properties":{"labels":{"type":"array","items":{"type":"string"}},"package_path":{"type":"string"},"new_label":{"type":"string"},"destroy_sources":{"type":"boolean"}},"required":["labels"]}},
     "console_cmd":        {"desc": "Run a console command (stat fps, DisableAllScreenMessages, r.*...) in the PIE world if alive, else the editor world.", "fn": tool_console_cmd, "schema": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
     "save_all":           {"desc": "Save all dirty packages (levels + assets).", "fn": tool_save_all, "schema": {"type":"object","properties":{}}},
+    "find_assets":        {"desc": "Search Content Browser assets by name substring, optionally by class (StaticMesh, Material, Texture2D...). No loading, registry only.", "fn": tool_find_assets, "schema": {"type":"object","properties":{"query":{"type":"string"},"class_filter":{"type":"string"},"path":{"type":"string","description":"Root path, default /Game"},"limit":{"type":"integer"}}}},
+    "asset_info":         {"desc": "Identify an asset: StaticMesh size/base-offset/material slots/triangles, MaterialInstance parent, Texture2D dimensions.", "fn": tool_asset_info, "schema": {"type":"object","properties":{"asset_path":{"type":"string"}},"required":["asset_path"]}},
+    "preview_asset":      {"desc": "SEE what a StaticMesh looks like: temp-spawn it far from the village, photograph it via SceneCapture (no viewport/focus needed), clean up. Returns the PNG path immediately.", "fn": tool_preview_asset, "schema": {"type":"object","properties":{"asset_path":{"type":"string"}},"required":["asset_path"]}},
+    "create_material_instance": {"desc": "Create a MaterialInstanceConstant from a parent with scalar/vector/texture parameter overrides, saved to disk.", "fn": tool_create_material_instance, "schema": {"type":"object","properties":{"parent":{"type":"string"},"name":{"type":"string"},"folder":{"type":"string","description":"Default /Game/Warden/Materials"},"scalar_params":{"type":"object"},"vector_params":{"type":"object","description":"name -> [r,g,b] or [r,g,b,a]"},"texture_params":{"type":"object","description":"name -> texture asset path"}},"required":["parent","name"]}},
+    "asset_ops":          {"desc": "Asset file operations: op = duplicate | rename | delete | exists. duplicate/rename need new_path.", "fn": tool_asset_ops, "schema": {"type":"object","properties":{"op":{"type":"string"},"asset_path":{"type":"string"},"new_path":{"type":"string"}},"required":["op","asset_path"]}},
 }
 
 # ── GAME TICK ─────────────────────────────────────────────────────────────────

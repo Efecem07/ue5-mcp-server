@@ -32,6 +32,53 @@ def spawn_points(n, count, cx, cy, radius):
     return pts
 
 
+def _point_blocked(x, y, blockers):
+    """Nokta bir engelin icinde mi? Engel: ("circle",cx,cy,r) ya da
+    ("obb",cx,cy,ex,ey,yaw_derece)."""
+    for b in blockers:
+        if b[0] == "circle":
+            _, cx, cy, r = b
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                return True
+        else:
+            _, cx, cy, ex, ey, yw = b
+            a = math.radians(yw)
+            ca, sa = math.cos(a), math.sin(a)
+            dx, dy = x - cx, y - cy
+            lx = dx * ca + dy * sa
+            ly = -dx * sa + dy * ca
+            if abs(lx) <= ex and abs(ly) <= ey:
+                return True
+    return False
+
+
+def near_blockers(x, y, blockers, radius=1800.0):
+    """Yakin engel on-suzgeci (kaba manhattan): adim testleri ucuz kalsin."""
+    out = []
+    for b in blockers:
+        if abs(b[1] - x) + abs(b[2] - y) < radius:
+            out.append(b)
+    return out
+
+
+def steer_step(x, y, tx, ty, step, blockers):
+    """Hedefe dogru TEK adim; adim bir engele girecekse +-35/70/105 derece
+    kayarak etrafindan dolanir (fizik beklentisi: citin icinden gecme).
+    Tamamen sariliysa yerinde kalir. Deterministik. Doner: (nx, ny)."""
+    dx, dy = tx - x, ty - y
+    L = math.hypot(dx, dy)
+    if L < 1e-6 or step <= 0:
+        return x, y
+    base = math.atan2(dy, dx)
+    for ang in (0.0, 35.0, -35.0, 70.0, -70.0, 105.0, -105.0):
+        a = base + math.radians(ang)
+        nx = x + math.cos(a) * step
+        ny = y + math.sin(a) * step
+        if not _point_blocked(nx, ny, blockers):
+            return nx, ny
+    return x, y
+
+
 def new_combat(town_x, town_y, town_hp):
     """Yeni savas baslangic durumu."""
     return {
@@ -68,11 +115,14 @@ def start_wave(state, n=None):
     return n
 
 
-def sim_tick(state, defenders, dt):
-    """Tek simulasyon adimi. Event listesi dondurur."""
+def sim_tick(state, defenders, dt, blockers=None):
+    """Tek simulasyon adimi. Event listesi dondurur.
+    blockers: hareket engelleri (bina OBB'leri, agac/kaya/cit daireleri);
+    dusmanlar iclerinden gecmek yerine steer_step ile dolanir."""
     events = []
     if dt <= 0:
         return events
+    blockers = blockers or []
 
     # 1. Grace fazi
     if state["phase"] == "grace":
@@ -96,6 +146,7 @@ def sim_tick(state, defenders, dt):
         kind = enemy["kind"]
         edef = ENEMY_DEFS[kind]
         ex, ey = enemy["x"], enemy["y"]
+        eblk = near_blockers(ex, ey, blockers) if blockers else []
 
         # Hedef sec: AGGRO_RADIUS icindeki en yakin unit
         best_uid = None
@@ -132,13 +183,9 @@ def sim_tick(state, defenders, dt):
                 tx, ty = target_def["x"], target_def["y"]
                 d_to_target = dist(ex, ey, tx, ty)
                 if d_to_target > edef["range"]:
-                    # Yuru
-                    if d_to_target > 0:
-                        ux = (tx - ex) / d_to_target
-                        uy = (ty - ey) / d_to_target
-                        move = edef["speed"] * dt
-                        enemy["x"] += ux * move
-                        enemy["y"] += uy * move
+                    # Yuru (engellerin etrafindan dolanarak)
+                    enemy["x"], enemy["y"] = steer_step(
+                        ex, ey, tx, ty, edef["speed"] * dt, eblk)
                 else:
                     # Saldir
                     dmg = edef["attack"] * dt
@@ -151,12 +198,9 @@ def sim_tick(state, defenders, dt):
             # TownHall'e git/saldir
             d_to_town = dist(ex, ey, state["town_x"], state["town_y"])
             if d_to_town > TOWN_ATTACK_RADIUS:
-                if d_to_town > 0:
-                    ux = (state["town_x"] - ex) / d_to_town
-                    uy = (state["town_y"] - ey) / d_to_town
-                    move = edef["speed"] * dt
-                    enemy["x"] += ux * move
-                    enemy["y"] += uy * move
+                enemy["x"], enemy["y"] = steer_step(
+                    ex, ey, state["town_x"], state["town_y"],
+                    edef["speed"] * dt, eblk)
             else:
                 # Binaya vur
                 dmg = edef["attack"] * dt

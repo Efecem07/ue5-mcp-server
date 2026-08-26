@@ -101,6 +101,10 @@ PLACE_MARGIN = 20.0  # binalar arası asgari boşluk (Manor Lords sıkılığı)
 # Statik engeller (ağaç/kaya/kuyu): [x, y, yarıçap] — save_state ile kalıcı
 obstacles = []
 
+# Hareket engelleri (çit parçaları vb.): [x, y, yarıçap] — YALNIZ birim
+# yürüyüşünü etkiler, bina yerleşimini ETKİLEMEZ (obstacles'tan farkı bu).
+nav_blockers = []
+
 # Çağ sistemi: 1 = Ahşap (palisad), 2 = Taş (taş sur). save_state ile kalıcı.
 age = 1
 AGE2_COST = {"wood": 100, "stone": 100, "gold": 150}
@@ -609,6 +613,7 @@ def save_state():
                 "roads": roads,
                 "placed_buildings": placed_buildings,
                 "obstacles": obstacles,
+                "nav_blockers": nav_blockers,
                 "age": age,
             }, f, ensure_ascii=False, indent=1)
     except Exception:
@@ -626,6 +631,7 @@ def load_state():
         game_year = st.get("game_year", 900)
         roads[:] = st.get("roads", [])
         obstacles[:] = st.get("obstacles", [])
+        nav_blockers[:] = st.get("nav_blockers", [])
         age = st.get("age", 1)
         pb = st.get("placed_buildings", [])
         # eski format (str listesi) göçü

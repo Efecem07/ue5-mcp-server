@@ -1060,6 +1060,49 @@ def _pie_unit_slot(w):
             pass
     return None
 
+def tool_nav_scan_fences(a):
+    """Cit parcalarini (DEC_Fence*) hareket engeli dairelerine cevirir ve
+    kalici state'e yazar. Halkalardaki gedikler ACIK kalir: haydutlar citin
+    icinden gecmek yerine gedige/etrafa yonelir. (Sur ringi BILEREK haric:
+    kapali ringde acgozlu kacinma kilitlenir; suru NavMesh portunda ele al.)"""
+    if wg is None:
+        raise Exception("warden_game yuklu degil")
+    prefix = a.get("prefix", "DEC_Fence")
+    rmin, rmax = float(a.get("r_min", 80)), float(a.get("r_max", 350))
+    yeni = []
+    for ac in unreal.EditorLevelLibrary.get_all_level_actors():
+        try:
+            if not ac.get_actor_label().startswith(prefix):
+                continue
+            ao, ae = ac.get_actor_bounds(False)
+            r = max(rmin, min(rmax, max(ae.x, ae.y)))
+            yeni.append([round(float(ao.x), 1), round(float(ao.y), 1), round(float(r), 1)])
+        except Exception:
+            pass
+    wg.nav_blockers[:] = yeni
+    wg.save_state()
+    return {"fence_blockers": len(yeni), "state_saved": True}
+
+def _nav_blockers_all():
+    """Birlesik hareket engelleri (1 sn onbellek): bina OBB + agac/kaya
+    daireleri + cit daireleri."""
+    now = time.monotonic()
+    c = _combat.get("blk")
+    if c is not None and now - c[0] < 1.0:
+        return c[1]
+    out = []
+    if wg is not None:
+        for b in wg.placed_buildings:
+            if isinstance(b, dict):
+                bx, by, ex, ey, yw = wg._building_obb(b, wg.FOOT_SCALE)
+                out.append(("obb", bx, by, ex, ey, yw))
+        for ob in wg.obstacles:
+            out.append(("circle", float(ob[0]), float(ob[1]), float(ob[2]) + 60.0))
+        for nb in getattr(wg, "nav_blockers", []):
+            out.append(("circle", float(nb[0]), float(nb[1]), float(nb[2])))
+    _combat["blk"] = (now, out)
+    return out
+
 def _combat_town():
     """TownHall kaydi (x, y, hp)."""
     if wg is None:
@@ -1187,7 +1230,7 @@ def _combat_tick(w, dt):
                           "hp": hp, "kind": "unit",
                           "speed": float(ud.get("speed", 280)),
                           "fighter": utype != "Peasant"})
-    events = wc.sim_tick(st, defenders, dt)
+    events = wc.sim_tick(st, defenders, dt, blockers=_nav_blockers_all())
     for ev in events:
         try:
             if ev[0] == "unit_hit":
@@ -1503,6 +1546,7 @@ TOOLS = {
     "asset_ops":          {"desc": "Asset file operations: op = duplicate | rename | delete | exists. duplicate/rename need new_path.", "fn": tool_asset_ops, "schema": {"type":"object","properties":{"op":{"type":"string"},"asset_path":{"type":"string"},"new_path":{"type":"string"}},"required":["op","asset_path"]}},
     "combat_setup_pool":  {"desc": "One-time editor setup: create the hidden enemy actor pool (copied into PIE). Run once before the first wave.", "fn": tool_combat_setup_pool, "schema": {"type":"object","properties":{"count":{"type":"integer","description":"Pool size, default 24"}}}},
     "unit_pool_setup":    {"desc": "One-time editor setup: hidden soldier slot pool that the in-game T key activates (editor Python cannot spawn into a running PIE).", "fn": tool_unit_pool_setup, "schema": {"type":"object","properties":{"count":{"type":"integer","description":"Pool size, default 12"}}}},
+    "nav_scan_fences":    {"desc": "Scan DEC_Fence* decor into persistent movement blockers so units walk around fences instead of through them (gaps stay open).", "fn": tool_nav_scan_fences, "schema": {"type":"object","properties":{"prefix":{"type":"string","description":"Label prefix, default DEC_Fence"},"r_min":{"type":"number"},"r_max":{"type":"number"}}}},
     "combat_start":       {"desc": "Start the bandit-wave defense loop (Faz A core). wave defaults to 1; radius shrinks spawn distance for quick tests (default 9000).", "fn": tool_combat_start, "schema": {"type":"object","properties":{"wave":{"type":"integer"},"radius":{"type":"number"}}}},
     "combat_status":      {"desc": "Live combat state: phase, wave, enemies left, TownHall hp, kills, gold earned, unit hp.", "fn": tool_combat_status, "schema": {"type":"object","properties":{}}},
     "combat_stop":        {"desc": "Stop the combat loop and release enemy actors.", "fn": tool_combat_stop, "schema": {"type":"object","properties":{}}},
@@ -2460,7 +2504,19 @@ def _pie_tick(dt):
                         if sel is not None:
                             _pie_hint(w, f"SECILI: {sel.get_actor_label()}  [SagTik hareket | M milis | B insa | Y yol]")
                         else:
-                            _pie_hint(w, "")
+                            # bina secimi (bina-uzerinden UX'e gecisin ilk adimi)
+                            tb = None
+                            try:
+                                tb = wg.building_at(p.x, p.y) if wg else None
+                            except Exception:
+                                pass
+                            if tb is not None and tb.get("type") == "Barracks":
+                                sc = " ".join(f"{k}:{v}" for k, v in wg.UNIT_DEFS.get("Soldier", {}).get("cost", {}).items())
+                                _pie_hint(w, f"KISLA  [T: asker egit ({sc})]", 4.0)
+                            elif tb is not None:
+                                _pie_hint(w, f"{tb.get('type', 'Bina').upper()}  [{tb.get('label', '')}]", 3.0)
+                            else:
+                                _pie_hint(w, "")
                 elif pc.was_input_key_just_pressed(_pie_key("RightMouseButton")):
                     p = _pie_cursor_hit(pc)
                     if p is not None:
@@ -2502,7 +2558,13 @@ def _pie_tick(dt):
                 done.append(lbl)
             continue
         yaw = _m.degrees(_m.atan2(dy, dx))
-        ac.set_actor_location(unreal.Vector(loc.x + dx / dist * step, loc.y + dy / dist * step, loc.z), False, False)
+        if wc is not None:
+            # engellerin (cit/agac/bina) icinden gecme: dolanarak yuru
+            nblk = wc.near_blockers(loc.x, loc.y, _nav_blockers_all())
+            nx, ny = wc.steer_step(loc.x, loc.y, tx, ty, step, nblk)
+        else:
+            nx, ny = loc.x + dx / dist * step, loc.y + dy / dist * step
+        ac.set_actor_location(unreal.Vector(nx, ny, loc.z), False, False)
         ac.set_actor_rotation(unreal.Rotator(0, 0, yaw), False)
     for lbl in done:
         _pie["orders"].pop(lbl, None)

@@ -158,15 +158,17 @@ def tool_spawn_unit(a):
         wg.earn({k: v * count for k, v in udef["cost"].items()})
         return {"success": False, "reason": f"Nüfus yetersiz. Mevcut: {wg.population['current']}/{wg.population['max']}, Gereken: +{pop_need}"}
 
-    # Birim şekli: Peasant = köylü silueti, diğerleri renkli küp (şimdilik)
+    # Birim gorseli: HERKES koylu silueti; sinif rengi MI_Warden* ile
+    # (koylu=dokulu varsayilan, asker=mavi, okcu=yesil, sovalye=gumus,
+    #  kusatma=kahve; dusman kirmizisi ayri - MI_WardenEnemy)
     kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
-    UNIT_MESHES = {"Peasant": "/Game/Warden/Units/SM_Villager2"}
-    mesh = unreal.load_asset(UNIT_MESHES.get(utype, "/Engine/BasicShapes/Cube"))
+    mesh = unreal.load_asset("/Game/Warden/Units/SM_Villager2") or unreal.load_asset("/Engine/BasicShapes/Cube")
     UNIT_COLORS = {
-        "Soldier":  "/Game/Warden/Materials/MI_Barracks",
-        "Archer":   "/Game/Warden/Materials/MI_Market",
-        "Knight":   "/Game/Warden/Materials/MI_TownHall",
-        "Siege":    "/Game/Warden/Materials/MI_Blacksmith",
+        "Soldier":  "/Game/Warden/Units/MI_WardenSoldier",
+        "Archer":   "/Game/Warden/Units/MI_WardenArcher",
+        "Knight":   "/Game/Warden/Units/MI_WardenKnight",
+        "Siege":    "/Game/Warden/Units/MI_WardenSiege",
+        "Militia":  "/Game/Warden/Units/MI_WardenMilitia",
     }
     mat = unreal.load_asset(UNIT_COLORS[utype]) if utype in UNIT_COLORS else None
     mb = mesh.get_bounds()
@@ -177,7 +179,7 @@ def tool_spawn_unit(a):
         offset_x = (i % 5) * 200
         offset_y = (i // 5) * 200
         ux, uy = loc["x"] + offset_x, loc["y"] + offset_y
-        uz = _ground_z(ux, uy) - mesh_min_z * (1.0 if utype in UNIT_MESHES else 0.5)
+        uz = _ground_z(ux, uy) - mesh_min_z
         ac = unreal.EditorLevelLibrary.spawn_actor_from_class(
             kls, unreal.Vector(ux, uy, uz),
             unreal.Rotator(pitch=0, yaw=0, roll=0))
@@ -187,9 +189,9 @@ def tool_spawn_unit(a):
             for comp in ac.get_components_by_class(unreal.StaticMeshComponent):
                 comp.set_mobility(unreal.ComponentMobility.MOVABLE)
                 comp.set_static_mesh(mesh)
-                if mat: comp.set_material(0, mat)
-            if utype not in UNIT_MESHES:
-                ac.set_actor_scale3d(unreal.Vector(0.5, 0.5, 0.8))
+                if mat:
+                    for si in range(comp.get_num_materials()):
+                        comp.set_material(si, mat)
             spawned_labels.append(label)
 
     wg.population["current"] += pop_need
@@ -973,7 +975,7 @@ def tool_combat_setup_pool(a):
     yeni aktor spawn edilemedigi icin build-slot deseninin aynisi)."""
     count = int(a.get("count", 24))
     mesh = unreal.load_asset("/Game/Warden/Units/SM_Villager2") or unreal.load_asset("/Engine/BasicShapes/Cube")
-    mat = unreal.load_asset("/Game/Warden/Units/M_WardenGhostBad")
+    mat = unreal.load_asset("/Game/Warden/Units/MI_WardenEnemy") or unreal.load_asset("/Game/Warden/Units/M_WardenGhostBad")
     kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
     mevcut = {ac.get_actor_label() for ac in unreal.EditorLevelLibrary.get_all_level_actors()
               if ac.get_actor_label().startswith(_ENEMY_SLOT_PREFIX)}
@@ -2316,7 +2318,7 @@ def _pie_tick(dt):
                         mil.add(lbl)
                         _combat["unit_hp"].pop(lbl, None)  # milis statlariyla tam can
                         try:
-                            mmat = _pie_asset("/Game/Warden/Materials/MI_Barracks")
+                            mmat = _pie_asset("/Game/Warden/Units/MI_WardenMilitia")
                             for comp in sel.get_components_by_class(unreal.StaticMeshComponent):
                                 for si in range(comp.get_num_materials()):
                                     comp.set_material(si, mmat)

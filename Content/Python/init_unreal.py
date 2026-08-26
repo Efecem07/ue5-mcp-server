@@ -14,8 +14,17 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
+# __file__ yalniz UE startup exec'inde tanimli; reload_tools'un yeniden
+# calistirmasinda yoktur. Yol bir kez cozulur, dosyada baska __file__ kullanma.
+try:
+    _SELF_PATH = os.path.abspath(__file__)
+except NameError:
+    _SELF_PATH = os.path.join(
+        unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()),
+        "Python", "init_unreal.py")
+
 # warden_game modülünü yükle
-_wg_path = os.path.join(os.path.dirname(__file__))
+_wg_path = os.path.dirname(_SELF_PATH)
 if _wg_path not in sys.path:
     sys.path.insert(0, _wg_path)
 try:
@@ -472,6 +481,345 @@ def tool_set_wall_age(a):
     unreal.EditorLevelLibrary.save_current_level()
     return {"age": age, "toggled": counts}
 
+# ── JOB SISTEMI ───────────────────────────────────────────────────────────────
+# Uzun isler (PIE smoke, screenshot bekleme) game-thread'i BLOKLAYAMAZ: tool
+# fonksiyonu tick icinde kosar, beklerse kare durur ve is asla bitmez. Cozum:
+# is = generator; her slate tick'te bir adim ilerler, tool aninda job id doner,
+# sonuc job_status ile okunur. (Eski yontem: builtins._warden_* marker + curl.)
+
+_jobs = {}  # id -> {"name","state","log","result","gen","t0"}
+
+def _job_start(name, gen_factory):
+    for k in [k for k, j in _jobs.items() if j["state"] != "running"][:-20]:
+        _jobs.pop(k, None)
+    jid = uuid.uuid4().hex[:8]
+    j = {"name": name, "state": "running", "log": [], "result": None, "t0": time.monotonic()}
+    j["gen"] = gen_factory(j["log"].append)
+    _jobs[jid] = j
+    return jid
+
+def _jobs_tick():
+    for j in list(_jobs.values()):
+        if j["state"] != "running":
+            continue
+        try:
+            next(j["gen"])
+        except StopIteration as e:
+            j["state"] = "done"
+            j["result"] = getattr(e, "value", None)
+        except Exception as ex:
+            j["state"] = "error"
+            j["result"] = str(ex)
+
+def tool_job_status(a):
+    jid = a.get("job_id")
+    if not jid:
+        return {"jobs": [{"id": k, "name": j["name"], "state": j["state"],
+                          "elapsed_s": round(time.monotonic() - j["t0"], 1)}
+                         for k, j in _jobs.items()]}
+    j = _jobs.get(jid)
+    if not j:
+        raise Exception(f"Job yok: {jid}")
+    return {"id": jid, "name": j["name"], "state": j["state"],
+            "elapsed_s": round(time.monotonic() - j["t0"], 1),
+            "log": j["log"][-12:], "result": j["result"]}
+
+# ── GELISTIRME ARACLARI (screenshot / python / PIE smoke / reload) ────────────
+
+def _screenshot_path(name):
+    base = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir())
+    return os.path.join(base, "Screenshots", "WindowsEditor", name)
+
+def _gen_wait_file(path, timeout, log):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            log(f"dosya hazir ({os.path.getsize(path)//1024} KB)")
+            return {"path": path, "size_kb": os.path.getsize(path) // 1024}
+        yield
+    raise Exception(f"Dosya {timeout} sn icinde olusmadi: {path}")
+
+def tool_screenshot(a):
+    name = a.get("name", "warden_shot.png")
+    if not name.lower().endswith(".png"):
+        name += ".png"
+    path = _screenshot_path(name)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+    unreal.AutomationLibrary.take_high_res_screenshot(
+        int(a.get("width", 1280)), int(a.get("height", 720)), name)
+    jid = _job_start("screenshot", lambda log: _gen_wait_file(path, 15.0, log))
+    return {"path": path, "job": jid,
+            "note": "Cekim sonraki karelerde yazilir; job_status(job) 'done' olunca dosyayi oku."}
+
+def tool_run_python_out(a):
+    """run_python'in guvenilir hali: stdout + result + traceback her zaman doner."""
+    import io, contextlib, traceback
+    buf = io.StringIO()
+    lv = {"unreal": unreal, "wg": wg, "result": None}
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(compile(a["code"], "<warden_out>", "exec"), lv)
+        res = lv.get("result")
+        try:
+            json.dumps(res)
+        except Exception:
+            res = repr(res)
+        return {"ok": True, "stdout": buf.getvalue()[-8000:], "result": res}
+    except Exception:
+        return {"ok": False, "stdout": buf.getvalue()[-4000:],
+                "traceback": traceback.format_exc()[-3000:]}
+
+def _gen_pie_smoke(seconds, shot_name, log):
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    les.editor_request_begin_play()
+    log("PIE istendi")
+    t0 = time.monotonic()
+    while _pie_world() is None:
+        if time.monotonic() - t0 > 30:
+            raise Exception("PIE 30 sn icinde acilmadi")
+        yield
+    log(f"PIE acildi ({round(time.monotonic()-t0,1)} sn)")
+    t1 = time.monotonic()
+    while time.monotonic() - t1 < seconds:
+        yield
+    path = _screenshot_path(shot_name)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+    unreal.AutomationLibrary.take_high_res_screenshot(1280, 720, shot_name)
+    log("screenshot istendi")
+    t2 = time.monotonic()
+    while time.monotonic() - t2 < 8.0 and not os.path.isfile(path):
+        yield
+    report = {
+        "pie_started": True,
+        "ran_seconds": seconds,
+        "screenshot": path if os.path.isfile(path) else None,
+        "hud_hint": _pie.get("hint", ""),
+        "pie_log_tail": list(_pie.get("log", []))[-10:],
+        "game_status": (wg.get_status() if wg else None),
+    }
+    les.editor_request_end_play()
+    log("PIE kapatiliyor")
+    t3 = time.monotonic()
+    while _pie_world() is not None and time.monotonic() - t3 < 20:
+        yield
+    report["pie_closed"] = _pie_world() is None
+    return report
+
+def tool_pie_smoke(a):
+    secs = float(a.get("seconds", 8))
+    name = a.get("screenshot_name", "pie_smoke.png")
+    if not name.lower().endswith(".png"):
+        name += ".png"
+    jid = _job_start("pie_smoke", lambda log: _gen_pie_smoke(secs, name, log))
+    return {"job": jid, "note": "job_status(job) ile takip et; done olunca rapor + screenshot yolu."}
+
+# reload'da korunan canli durum: bunlar exec ile SIFIRLANMAMALI, yoksa PIE'de
+# kurulan binalar (pending_builds) ve calisan isler kaybolur (hayalet bina tuzagi).
+_KEEP_ON_RELOAD = ("_pie", "_unit_orders", "_rts_state", "_jobs", "_last_prod_t",
+                   "_pending_cmds", "_result_store", "_pending_lock", "_result_lock",
+                   "_SESSION", "_SERVER_STARTED", "_tick_accum")
+
+def tool_reload_tools(a):
+    g = globals()
+    src_path = _SELF_PATH
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
+    code = compile(src, src_path, "exec")  # sentaks hatasi burada patlar, eski araclar yasar
+    kept = {k: g[k] for k in _KEEP_ON_RELOAD if k in g}
+    g.setdefault("__file__", src_path)  # UE startup sonrasi silmis oluyor
+    if a.get("reload_game", False) and wg is not None:
+        wg.save_state()
+        importlib.reload(wg)
+    exec(code, g)
+    g.update(kept)
+    return {"reloaded": True, "tool_count": len(g["TOOLS"]),
+            "kept_state": sorted(kept), "game_reloaded": bool(a.get("reload_game", False))}
+
+# ── OYUN DURUMU ARACLARI ──────────────────────────────────────────────────────
+
+def tool_game_state(a):
+    if wg is None:
+        raise Exception("warden_game yuklu degil")
+    st = wg.get_status()
+    st["age"] = getattr(wg, "age", 1)
+    st["obstacle_count"] = len(wg.obstacles)
+    st["state_file"] = wg._STATE_PATH
+    return st
+
+def tool_set_state(a):
+    """Test senaryosu kurmak icin state yamasi (kaynak/nufus/cag/yil)."""
+    if wg is None:
+        raise Exception("warden_game yuklu degil")
+    patch = a.get("patch", {})
+    izinli = {"resources", "population", "age", "game_year"}
+    bilinmeyen = set(patch) - izinli
+    if bilinmeyen:
+        raise Exception(f"Bilinmeyen alan: {sorted(bilinmeyen)}. Izinli: {sorted(izinli)}")
+    if "resources" in patch:
+        wg.resources.update({k: int(v) for k, v in patch["resources"].items()})
+    if "population" in patch:
+        wg.population.update({k: int(v) for k, v in patch["population"].items()})
+    if "age" in patch:
+        wg.age = int(patch["age"])
+    if "game_year" in patch:
+        wg.game_year = int(patch["game_year"])
+    wg.save_state()
+    return tool_game_state({})
+
+# ── SAHNE ARACLARI (list/obb/spawn/materyal/import/merge/konsol/kayit) ────────
+
+def tool_list_actors(a):
+    filt = (a.get("filter") or "").lower()
+    cls = (a.get("class_filter") or "").lower()
+    limit = int(a.get("limit", 200))
+    with_bounds = bool(a.get("bounds", False))
+    out = []
+    for ac in unreal.EditorLevelLibrary.get_all_level_actors():
+        lbl = ac.get_actor_label()
+        cn = ac.get_class().get_name()
+        if filt and filt not in lbl.lower():
+            continue
+        if cls and cls not in cn.lower():
+            continue
+        loc = ac.get_actor_location()
+        e = {"label": lbl, "class": cn,
+             "x": round(loc.x, 1), "y": round(loc.y, 1), "z": round(loc.z, 1),
+             "folder": str(ac.get_folder_path())}
+        if with_bounds:
+            ao, ae = ac.get_actor_bounds(False)
+            e["aabb"] = [round(ao.x - ae.x, 1), round(ao.y - ae.y, 1),
+                         round(ao.x + ae.x, 1), round(ao.y + ae.y, 1)]
+        out.append(e)
+        if len(out) >= limit:
+            break
+    return {"actors": out, "count": len(out), "truncated": len(out) >= limit}
+
+def tool_actor_obb(a):
+    """Gercek donmus taban: yerlesim hatasi ayiklarken kayit vs sahne karsilastir."""
+    lbl = a["actor_label"]
+    reg = None
+    if wg is not None:
+        reg = next((b for b in wg.placed_buildings
+                    if isinstance(b, dict) and b.get("label") == lbl), None)
+    for ac in unreal.EditorLevelLibrary.get_all_level_actors():
+        if ac.get_actor_label() == lbl:
+            ao, ae = ac.get_actor_bounds(False)
+            rot = ac.get_actor_rotation()
+            out = {"label": lbl, "yaw": round(rot.yaw, 1),
+                   "world_center": [round(ao.x, 1), round(ao.y, 1), round(ao.z, 1)],
+                   "world_extent": [round(ae.x, 1), round(ae.y, 1), round(ae.z, 1)]}
+            if reg is not None:
+                out["registered_obb"] = reg.get("obb")
+                out["registered_aabb"] = reg.get("aabb")
+            return out
+    raise Exception(f"Not found: {lbl}")
+
+def tool_spawn_mesh(a):
+    """Genel StaticMeshActor spawner: zemine oturtma + etiket + outliner klasoru."""
+    mesh = unreal.load_asset(a["mesh_path"])
+    if not mesh:
+        raise Exception(f"Asset yok: {a['mesh_path']}")
+    x, y = float(a.get("x", 0)), float(a.get("y", 0))
+    yaw = float(a.get("yaw", 0))
+    sc = float(a.get("scale", 1.0))
+    label = a.get("label") or f"WARDEN_Mesh_{int(x)}_{int(y)}"
+    kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
+    if a.get("ground_snap", True):
+        b = mesh.get_bounds()
+        z = _ground_z(x, y) - (b.origin.z - b.box_extent.z) * sc
+    else:
+        z = float(a.get("z", 0))
+    ac = unreal.EditorLevelLibrary.spawn_actor_from_class(
+        kls, unreal.Vector(x, y, z), unreal.Rotator(0, 0, yaw))
+    if not ac:
+        raise Exception("Spawn olmadi")
+    ac.set_actor_label(label)
+    ac.set_folder_path(a.get("folder", "Warden/Spawned"))
+    comps = ac.get_components_by_class(unreal.StaticMeshComponent)
+    if comps:
+        comps[0].set_mobility(unreal.ComponentMobility.MOVABLE)
+        comps[0].set_static_mesh(mesh)
+    if sc != 1.0:
+        ac.set_actor_scale3d(unreal.Vector(sc, sc, sc))
+    return {"spawned": label, "location": [x, y, round(z, 1)], "mesh": a["mesh_path"]}
+
+def tool_set_materials(a):
+    """Aktorun materyal slotlarini degistir. materials: {\"0\": \"/Game/...\", ...}"""
+    lbl = a["actor_label"]
+    mats = a["materials"]
+    for ac in unreal.EditorLevelLibrary.get_all_level_actors():
+        if ac.get_actor_label() != lbl:
+            continue
+        comps = ac.get_components_by_class(unreal.StaticMeshComponent)
+        if not comps:
+            raise Exception(f"{lbl}: StaticMeshComponent yok")
+        applied, failed = [], []
+        items = mats.items() if isinstance(mats, dict) else enumerate(mats)
+        for slot, mp in items:
+            m = unreal.load_asset(mp)
+            if m:
+                comps[0].set_material(int(slot), m)
+                applied.append([int(slot), mp])
+            else:
+                failed.append(mp)
+        return {"actor": lbl, "applied": applied, "failed": failed}
+    raise Exception(f"Not found: {lbl}")
+
+def tool_import_asset(a):
+    """Genel dosya importu (GLB/FBX/PNG/WAV...). import_building_glb'nin genellemesi."""
+    fpath = a["file_path"]
+    if not os.path.isfile(fpath):
+        raise Exception(f"Dosya yok: {fpath}")
+    task = unreal.AssetImportTask()
+    task.filename = fpath
+    task.destination_path = a.get("destination", "/Game/Warden/Imported")
+    task.automated = True
+    task.replace_existing = True
+    task.save = True
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    paths = [str(p) for p in (task.imported_object_paths or [])]
+    if not paths:
+        raise Exception("Import hicbir asset uretmedi (format destekleniyor mu?)")
+    return {"imported": paths, "count": len(paths)}
+
+def tool_merge_actors(a):
+    """Etiket listesindeki StaticMeshActor'lari tek mesh'e birlestir (DENEYSEL).
+    Bilinen tuzak: sonuc paketi SM_ oneki alir; kaynak aktorler varsayilan KALIR."""
+    labels = set(a["labels"])
+    actors = [ac for ac in unreal.EditorLevelLibrary.get_all_level_actors()
+              if ac.get_actor_label() in labels]
+    if len(actors) < 2:
+        raise Exception(f"En az 2 aktor gerek; bulunan: {[x.get_actor_label() for x in actors]}")
+    opts = unreal.MergeStaticMeshActorsOptions()
+    opts.base_package_name = a.get("package_path", "/Game/Warden/Merged/SM_WardenMerged")
+    opts.new_actor_label = a.get("new_label", "WARDEN_Merged")
+    opts.destroy_source_actors = bool(a.get("destroy_sources", False))
+    opts.spawn_merged_actor = True
+    res = unreal.EditorLevelLibrary.merge_static_mesh_actors(actors, opts)
+    if isinstance(res, tuple):
+        res = res[-1]
+    return {"merged_actor": res.get_actor_label() if res else None,
+            "package": str(opts.base_package_name),
+            "source_count": len(actors),
+            "sources_destroyed": bool(opts.destroy_source_actors)}
+
+def tool_console_cmd(a):
+    w = _pie_world() or unreal.EditorLevelLibrary.get_editor_world()
+    unreal.SystemLibrary.execute_console_command(w, a["command"])
+    return {"executed": a["command"], "world": w.get_name()}
+
+def tool_save_all(a):
+    ok = unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
+    return {"saved": bool(ok)}
+
 TOOLS = {
     "get_project_info":   {"desc": "Get Warden project info and actor count.",       "fn": tool_get_project_info,  "schema": {"type":"object","properties":{}}},
     "get_all_actors":     {"desc": "List all actors in the current UE5 level.",       "fn": tool_get_all_actors,    "schema": {"type":"object","properties":{}}},
@@ -489,10 +837,24 @@ TOOLS = {
     "spawn_unit":         {"desc": "Spawn Warden units: Peasant/Soldier/Archer/Knight/Siege. Checks resources+population.", "fn": tool_spawn_unit, "schema": {"type":"object","properties":{"unit_type":{"type":"string"},"location":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}}},"count":{"type":"integer"}},"required":["unit_type"]}},
     "build_building":     {"desc": "Build a Warden building with real mesh: checks resources AND road-adjacency rule (buildings must be next to a road; build roads first with add_road).", "fn": tool_build_building, "schema": {"type":"object","properties":{"building_type":{"type":"string","description":"TownHall/Farm/Barracks/Blacksmith/Market/House/Tower/Wall/Lumbermill/Quarry/Castle"},"location":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}}},"label":{"type":"string"}},"required":["building_type"]}},
     "add_road":           {"desc": "Build a dirt road along waypoints. Buildings can only be placed adjacent to roads. Cost: 1 gold per 100 units.", "fn": tool_add_road, "schema": {"type":"object","properties":{"points":{"type":"array","items":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"]}},"width":{"type":"number"},"free":{"type":"boolean","description":"Skip cost (founder roads)"}},"required":["points"]}},
-    "move_unit":          {"desc": "Order a unit to walk to (x,y). Unit moves smoothly each tick at its speed.", "fn": tool_move_unit, "schema": {"type":"object","properties":{"actor_label":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"speed":{"type":"number"}},"required":["actor_label","x","y"]}},
     "set_wall_age":       {"desc": "Switch village wall era: 'palisade' (age 1 wood) or 'stone' (age 2). Sets are hidden/shown, not deleted.", "fn": tool_set_wall_age, "schema": {"type":"object","properties":{"age":{"type":"string","description":"palisade | stone"}},"required":["age"]}},
     "demolish_building":  {"desc": "Demolish a building by actor label. Refunds half the resources.", "fn": tool_demolish_building, "schema": {"type":"object","properties":{"actor_label":{"type":"string"}},"required":["actor_label"]}},
     "import_building_glb":{"desc": "Import a GLB 3D model and swap all WARDEN_<type> building actors to it. Auto-scales to old footprint.", "fn": tool_import_building_glb, "schema": {"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to .glb file"},"building_type":{"type":"string","description":"TownHall/Farm/Barracks/Blacksmith/Market/Tower/Wall/Lumbermill/Quarry/Castle"},"auto_fit":{"type":"boolean","description":"Scale new mesh to old footprint (default true)"}},"required":["file_path","building_type"]}},
+    "screenshot":         {"desc": "Take an editor/PIE screenshot. Returns the absolute file path plus a job id; poll job_status until done, then read the file.", "fn": tool_screenshot, "schema": {"type":"object","properties":{"name":{"type":"string","description":"File name (default warden_shot.png)"},"width":{"type":"integer"},"height":{"type":"integer"}}}},
+    "run_python_out":     {"desc": "Execute Python in UE5 and RELIABLY return stdout, the 'result' variable and any traceback. Prefer this over run_python.", "fn": tool_run_python_out, "schema": {"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}},
+    "pie_smoke":          {"desc": "One-call verification loop: start PIE, run N seconds, take a screenshot, stop PIE, report game status. Returns a job id; poll job_status.", "fn": tool_pie_smoke, "schema": {"type":"object","properties":{"seconds":{"type":"number","description":"How long PIE runs (default 8)"},"screenshot_name":{"type":"string"}}}},
+    "job_status":         {"desc": "Check a background job (pie_smoke, screenshot). Without job_id lists all jobs.", "fn": tool_job_status, "schema": {"type":"object","properties":{"job_id":{"type":"string"}}}},
+    "reload_tools":       {"desc": "Hot-reload this tool file from disk WITHOUT restarting the editor. Preserves live PIE state and running jobs. reload_game=true also reloads warden_game (state is saved first).", "fn": tool_reload_tools, "schema": {"type":"object","properties":{"reload_game":{"type":"boolean"}}}},
+    "game_state":         {"desc": "Full Warden game state: resources, population, age, roads, buildings, obstacles, state file path.", "fn": tool_game_state, "schema": {"type":"object","properties":{}}},
+    "set_state":          {"desc": "Patch game state for test scenarios. patch may contain: resources{}, population{}, age, game_year. Saves and returns new state.", "fn": tool_set_state, "schema": {"type":"object","properties":{"patch":{"type":"object"}},"required":["patch"]}},
+    "list_actors":        {"desc": "List level actors with label/class/location/folder, optional AABB. Filter by label or class substring.", "fn": tool_list_actors, "schema": {"type":"object","properties":{"filter":{"type":"string","description":"Label substring"},"class_filter":{"type":"string","description":"Class name substring"},"limit":{"type":"integer","description":"Default 200"},"bounds":{"type":"boolean","description":"Include world AABB"}}}},
+    "actor_obb":          {"desc": "Real placed footprint of one actor: world bounds + yaw + the registered OBB/AABB from game state (placement debugging).", "fn": tool_actor_obb, "schema": {"type":"object","properties":{"actor_label":{"type":"string"}},"required":["actor_label"]}},
+    "spawn_mesh":         {"desc": "Spawn any StaticMesh asset as an actor: ground-snapped, labeled, foldered, scaled. General content tool (no game rules).", "fn": tool_spawn_mesh, "schema": {"type":"object","properties":{"mesh_path":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number","description":"Used only when ground_snap=false"},"yaw":{"type":"number"},"scale":{"type":"number"},"label":{"type":"string"},"folder":{"type":"string"},"ground_snap":{"type":"boolean","description":"Default true: seat mesh base on landscape"}},"required":["mesh_path"]}},
+    "set_materials":      {"desc": "Set material slots on an actor's StaticMeshComponent. materials = {\"0\": \"/Game/...\"} or a list of paths.", "fn": tool_set_materials, "schema": {"type":"object","properties":{"actor_label":{"type":"string"},"materials":{"type":"object","description":"slot index -> material asset path"}},"required":["actor_label","materials"]}},
+    "import_asset":       {"desc": "Import any file (GLB/FBX/PNG/WAV...) into the Content Browser. Returns imported asset paths.", "fn": tool_import_asset, "schema": {"type":"object","properties":{"file_path":{"type":"string"},"destination":{"type":"string","description":"Default /Game/Warden/Imported"}},"required":["file_path"]}},
+    "merge_actors":       {"desc": "EXPERIMENTAL: merge labeled StaticMeshActors into one mesh asset (+ merged actor). Known quirk: result package gets SM_ prefix.", "fn": tool_merge_actors, "schema": {"type":"object","properties":{"labels":{"type":"array","items":{"type":"string"}},"package_path":{"type":"string"},"new_label":{"type":"string"},"destroy_sources":{"type":"boolean"}},"required":["labels"]}},
+    "console_cmd":        {"desc": "Run a console command (stat fps, DisableAllScreenMessages, r.*...) in the PIE world if alive, else the editor world.", "fn": tool_console_cmd, "schema": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+    "save_all":           {"desc": "Save all dirty packages (levels + assets).", "fn": tool_save_all, "schema": {"type":"object","properties":{}}},
 }
 
 # ── GAME TICK ─────────────────────────────────────────────────────────────────
@@ -680,6 +1042,11 @@ def tool_move_unit(a):
             _unit_orders[lbl] = {"actor": ac, "path": path, "speed": float(a.get("speed", speed))}
             return {"moving": lbl, "target": [tx, ty], "waypoints": len(path), "speed": _unit_orders[lbl]["speed"]}
     raise Exception(f"Not found: {lbl}")
+
+# tool_move_unit yukaridaki TOOLS sozlugunden SONRA tanimlanir; kaydi burada
+# yapilir (sozluk literaline koymak import aninda NameError verir - 2026-08-26'da
+# taze editor acilisinda yakalandi, canli enjeksiyon donemi bunu maskelemisti).
+TOOLS["move_unit"] = {"desc": "Order a unit to walk to (x,y). Unit moves smoothly each tick at its speed.", "fn": tool_move_unit, "schema": {"type":"object","properties":{"actor_label":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"speed":{"type":"number"}},"required":["actor_label","x","y"]}}
 
 # ── PIE SELECTION & RIGHT-CLICK ORDERS ────────────────────────────────────────
 # PIE'de sol tık = birim seç (yakınlık bazlı, çarpışma gerektirmez),
@@ -1412,6 +1779,10 @@ def _process_commands(dt):
         _pie_tick(dt)
     except Exception:
         pass
+    try:
+        _jobs_tick()
+    except Exception:
+        pass
     with _pending_lock:
         if not _pending_cmds: return
         cmd = _pending_cmds.pop(0)
@@ -1560,12 +1931,25 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 # ── STARTUP ────────────────────────────────────────────────────────────────────
 
+def _tick_trampoline(dt):
+    # Sabit sarici: slate'e BU kayitli kalir, govde asla degismez. Boylece
+    # reload_tools sonrasi bile guncel _process_commands calisir (eski
+    # callback'ler silinemedigi icin dogrudan kayit reload'u imkansiz kilardi).
+    try:
+        globals()["_process_commands"](dt)
+    except Exception:
+        pass
+
 def _start():
+    if globals().get("_SERVER_STARTED"):
+        unreal.log("[Warden MCP] reload: sunucu zaten ayakta, start atlandi")
+        return
     try:
         srv = ThreadedHTTPServer(("127.0.0.1", MCP_PORT), MCPHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        unreal.register_slate_post_tick_callback(_process_commands)
-        unreal.log(f"[Warden MCP] v3 ready → http://127.0.0.1:{MCP_PORT}{MCP_PATH}")
+        unreal.register_slate_post_tick_callback(_tick_trampoline)
+        globals()["_SERVER_STARTED"] = True
+        unreal.log(f"[Warden MCP] v3 ready → http://127.0.0.1:{MCP_PORT}{MCP_PATH} ({len(TOOLS)} tools)")
     except Exception as e:
         unreal.log_error(f"[Warden MCP] start failed: {e}")
 

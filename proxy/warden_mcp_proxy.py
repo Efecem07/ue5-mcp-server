@@ -1,6 +1,9 @@
 """
-Warden MCP Proxy v3 - Self-initializing stdio bridge to UE5
-- initialize/tools/list handled locally (tools appear even when UE5 is off)
+Warden MCP Proxy v3.1 - Self-initializing stdio bridge to UE5
+- initialize handled locally (client handshake succeeds even when UE5 is off)
+- tools/list asks the live server first, so the registry inside the editor is
+  the single source of truth; the static table below is only the offline
+  fallback (generic editor tools) shown while UE5 is closed
 - tools/call forwarded to UE5 at port 9876
 """
 import sys, json, urllib.request, urllib.error
@@ -71,6 +74,9 @@ def handle(msg):
         }}
 
     if method == "tools/list":
+        live = call_ue5(msg)
+        if isinstance(live, dict) and "error" not in live:
+            return live
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
 
     if method.startswith("notifications/") or rid is None:

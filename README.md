@@ -17,7 +17,9 @@ Claude Code  ──stdio──▶  warden_mcp_proxy.py  ──HTTP/SSE──▶ 
 
 Two problems make the naive version impossible, and most of the code exists to solve them.
 
-**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threaded by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event for up to 30 seconds, `_process_commands` runs **on the game thread** via `register_slate_post_tick_callback`, takes one command per tick, writes the outcome to a result store and signals the waiter. The HTTP thread then serialises the result. Every one of the 20 tools goes through this path, and a caller that never gets signalled gets a timeout rather than a hung socket.
+**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threaded by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event for up to 30 seconds, `_process_commands` runs **on the game thread** via `register_slate_post_tick_callback`, takes one command per tick, writes the outcome to a result store and signals the waiter. The HTTP thread then serialises the result. Every one of the 35 tools goes through this path, and a caller that never gets signalled gets a timeout rather than a hung socket.
+
+The same constraint cuts the other way for long operations. A tool body executes *on* the tick, so a tool that waits — for a screenshot file to appear, for Play-In-Editor to boot, run for a while and shut down — would freeze the frame loop and deadlock the very thing it is waiting for. Those tools return a job id immediately instead. A job is a Python generator; `_jobs_tick` advances every running job by one `next()` per slate tick, so a job "sleeps" by yielding and the editor keeps rendering. `job_status` polls the result. This is what lets `pie_smoke` express start-PIE → simulate N seconds → screenshot → stop-PIE → report as a single tool call.
 
 That same tick callback also drives the game simulation, the camera, unit movement and the in-editor play layer. Each of those is wrapped in its own `try/except` for a reason that cost a debugging session: one unhandled exception anywhere in the chain makes Unreal drop the entire slate callback, silently, and everything downstream stops ticking with no error in the log.
 
@@ -40,8 +42,28 @@ That same tick callback also drives the game simulation, the camera, unit moveme
 | `create_folder` | Create a Content Browser folder |
 | `save_level` | Save the current level |
 | `run_python` | Execute arbitrary Python inside the editor, with the `unreal` module in scope |
+| `run_python_out` | Same, but reliably returns stdout, the `result` variable and full tracebacks |
+| `list_actors` | Filtered actor listing (label/class substring) with location, folder, optional AABB |
+| `actor_obb` | One actor's real world bounds and yaw, compared against its registered footprint |
+| `spawn_mesh` | Spawn any StaticMesh asset: ground-snapped to the landscape, labeled, foldered, scaled |
+| `set_materials` | Set material slots on an actor |
+| `import_asset` | Import any file (GLB/FBX/PNG/WAV...) into the Content Browser |
+| `merge_actors` | Merge labeled StaticMeshActors into one mesh asset (experimental) |
+| `console_cmd` | Run a console command in the PIE world if alive, else the editor world |
+| `save_all` | Save all dirty packages |
 
-`run_python` is the escape hatch. Anything the typed tools do not cover, the agent writes itself and runs in-process.
+`run_python_out` is the escape hatch. Anything the typed tools do not cover, the agent writes itself and runs in-process.
+
+**Development loop (what makes the agent fast)**
+
+| Tool | Does |
+|---|---|
+| `screenshot` | High-res editor/PIE screenshot; returns the absolute file path plus a job id that completes when the file exists |
+| `pie_smoke` | One-call verification loop: start PIE, run N seconds, screenshot, stop PIE, report game state and the PIE event log |
+| `job_status` | Poll background jobs; without an id, lists them all |
+| `reload_tools` | Hot-reload the tool file from disk without restarting the editor, preserving live PIE state and running jobs; a syntax error aborts the reload and keeps the old tools alive |
+
+`reload_tools` deserves a note: slate callbacks cannot be unregistered from Python, so the server registers a permanent trampoline that dispatches to whatever `_process_commands` currently is, and reloading re-executes the file into the same module globals while pinning the state that must survive (PIE pending-build queues, running jobs, the HTTP server itself).
 
 **Game domain (Warden specific, shown as an example layer)**
 
@@ -73,6 +95,9 @@ Content/Python/warden_game.py   Domain model imported by the server: building an
                                 the production rules the game tools enforce.
 proxy/warden_mcp_proxy.py       stdio to HTTP bridge for the MCP client.
 proxy/warden_mcp.cmd            Launcher, runs the bridge on Unreal's bundled Python.
+Config/DefaultEditorPerProjectUserSettings.ini
+                                Keeps the editor rendering in the background so
+                                screenshot tools work while another window has focus.
 ```
 
 ## Install
@@ -103,7 +128,8 @@ Edit `UE_PYTHON` in `warden_mcp.cmd` if your engine is not at the default 5.8 pa
 
 ## Known limitations
 
-- **The proxy's static tool table lists the 11 editor tools only.** The server generates its own `tools/list` from the `TOOLS` registry, so it advertises all 20; the proxy's copy is hand-maintained and has drifted. The 9 game tools still execute correctly when called, since `tools/call` is forwarded verbatim, but a client that trusts the proxy's list will not know they exist. The two want generating from one source.
+- **The proxy's static table is an offline fallback, not the registry.** `tools/list` is forwarded to the live server first, so with the editor open the client always sees the full, current toolset; the static table only answers while UE5 is closed and deliberately lists just the generic editor tools.
+- **Screenshots need frames.** The editor throttles rendering when its window is in the background, and an unrendered frame writes no screenshot file. The included `Config/DefaultEditorPerProjectUserSettings.ini` ships `bThrottleCPUWhenNotForeground=False` for exactly this reason (the settings class is not exposed to Python in 5.8, so it cannot be flipped at runtime).
 - **No authentication.** The server binds `127.0.0.1:9876` and trusts every caller. `run_python` executes arbitrary code in the editor process, so this is a local development tool and nothing else. Do not expose the port.
 - **Windows paths** are assumed in the launcher.
 - **Code comments are in Turkish.** The tool descriptions, schemas and this document are in English.

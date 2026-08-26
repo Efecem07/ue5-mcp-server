@@ -32,6 +32,11 @@ try:
 except Exception as _e:
     unreal.log_warning(f"[Warden MCP] warden_game import failed: {_e}")
     wg = None
+try:
+    import warden_combat as wc
+except Exception as _e:
+    unreal.log_warning(f"[Warden MCP] warden_combat import failed: {_e}")
+    wc = None
 
 MCP_PORT   = 9876
 MCP_PATH   = "/mcp"
@@ -737,7 +742,7 @@ def tool_pie_smoke(a):
 # kurulan binalar (pending_builds) ve calisan isler kaybolur (hayalet bina tuzagi).
 _KEEP_ON_RELOAD = ("_pie", "_unit_orders", "_rts_state", "_jobs", "_last_prod_t",
                    "_pending_cmds", "_result_store", "_pending_lock", "_result_lock",
-                   "_SESSION", "_SERVER_STARTED", "_tick_accum")
+                   "_SESSION", "_SERVER_STARTED", "_tick_accum", "_combat")
 
 def tool_reload_tools(a):
     g = globals()
@@ -750,6 +755,8 @@ def tool_reload_tools(a):
     if a.get("reload_game", False) and wg is not None:
         wg.save_state()
         importlib.reload(wg)
+        if wc is not None:
+            importlib.reload(wc)
     exec(code, g)
     g.update(kept)
     return {"reloaded": True, "tool_count": len(g["TOOLS"]),
@@ -931,6 +938,247 @@ def tool_console_cmd(a):
 def tool_save_all(a):
     ok = unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
     return {"saved": bool(ok)}
+
+# ── SAVAS SISTEMI (Faz A: dusman dalgasi / savunma dongusu) ──────────────────
+# Saf mantik warden_combat.py'de (unreal'siz, offline test edilebilir, C++'a
+# tasinabilir). Burasi UE katmani: aktor havuzu, PIE tick koprusu, HUD, tuslar.
+
+_combat = {"state": None, "unit_hp": {}, "slots": None, "slot_map": {},
+           "gz": {}, "hud_t": 0.0, "over_msg": False}
+
+_ENEMY_SLOT_PREFIX = "WARDEN_EnemySlot_"
+
+def tool_combat_setup_pool(a):
+    """Editor'de gizli dusman aktor havuzu kurar (PIE'ye kopyalanir; PIE icinde
+    yeni aktor spawn edilemedigi icin build-slot deseninin aynisi)."""
+    count = int(a.get("count", 24))
+    mesh = unreal.load_asset("/Game/Warden/Units/SM_Villager2") or unreal.load_asset("/Engine/BasicShapes/Cube")
+    mat = unreal.load_asset("/Game/Warden/Units/M_WardenGhostBad")
+    kls = unreal.load_class(None, "/Script/Engine.StaticMeshActor")
+    mevcut = {ac.get_actor_label() for ac in unreal.EditorLevelLibrary.get_all_level_actors()
+              if ac.get_actor_label().startswith(_ENEMY_SLOT_PREFIX)}
+    yeni = []
+    for i in range(count):
+        lbl = f"{_ENEMY_SLOT_PREFIX}{i:02d}"
+        if lbl in mevcut:
+            continue
+        ac = unreal.EditorLevelLibrary.spawn_actor_from_class(
+            kls, unreal.Vector(-40000 + i * 300, -40000, 0), unreal.Rotator(0, 0, 0))
+        if not ac:
+            continue
+        ac.set_actor_label(lbl)
+        ac.set_folder_path("Warden/Combat")
+        comps = ac.get_components_by_class(unreal.StaticMeshComponent)
+        if comps:
+            comps[0].set_mobility(unreal.ComponentMobility.MOVABLE)
+            comps[0].set_static_mesh(mesh)
+            if mat:
+                for si in range(comps[0].get_num_materials()):
+                    comps[0].set_material(si, mat)
+        ac.set_actor_hidden_in_game(True)
+        yeni.append(lbl)
+    unreal.EditorLevelLibrary.save_current_level()
+    return {"created": len(yeni), "existing": len(mevcut), "total": len(mevcut) + len(yeni)}
+
+def _combat_town():
+    """TownHall kaydi (x, y, hp)."""
+    if wg is None:
+        return None
+    for b in wg.placed_buildings:
+        if isinstance(b, dict) and b.get("type") == "TownHall":
+            hp = wg.BUILDING_DEFS.get("TownHall", {}).get("health", 500)
+            return float(b["x"]), float(b["y"]), float(hp)
+    return None
+
+def _combat_start_wave(st, n, radius):
+    """wc.start_wave'in yaricap secilebilir hali (test icin dusuk yaricap)."""
+    st["wave"] = n
+    st["phase"] = "fighting"
+    comp = wc.wave_composition(n)
+    pts = wc.spawn_points(n, len(comp), st["town_x"], st["town_y"], radius)
+    for i, (kind, (x, y)) in enumerate(zip(comp, pts)):
+        st["enemies"][f"e{n}_{i}"] = {
+            "kind": kind, "x": x, "y": y,
+            "hp": float(wc.ENEMY_DEFS[kind]["hp"]), "target": None}
+    return n
+
+def tool_combat_start(a):
+    """Savasi baslat: dalga n (varsayilan 1). radius test icin kucultulebilir."""
+    if wc is None:
+        raise Exception("warden_combat yuklu degil")
+    town = _combat_town()
+    if town is None:
+        raise Exception("TownHall kaydi bulunamadi")
+    tx, ty, thp = town
+    st = wc.new_combat(tx, ty, thp)
+    _combat["state"] = st
+    _combat["unit_hp"] = {}
+    _combat["slot_map"] = {}
+    _combat["gz"] = {}
+    _combat["over_msg"] = False
+    n = int(a.get("wave", 1))
+    radius = float(a.get("radius", 9000.0))
+    _combat["radius"] = radius
+    _combat_start_wave(st, n, radius)
+    return {"started": True, "wave": n, "enemies": len(st["enemies"]),
+            "town_hp": st["town_hp"], "radius": radius,
+            "preview": wc.wave_preview(n)}
+
+def tool_combat_status(a):
+    st = _combat["state"]
+    if st is None:
+        return {"active": False}
+    return {"active": True, "phase": st["phase"], "wave": st["wave"],
+            "enemies_left": len(st["enemies"]), "town_hp": round(st["town_hp"], 1),
+            "town_hp_max": st["town_hp_max"], "kills": st["kills"],
+            "gold_earned": st["gold_earned"], "grace_left": round(st.get("grace_left", 0), 1),
+            "unit_hp": {k: round(v, 1) for k, v in _combat["unit_hp"].items()}}
+
+def tool_combat_stop(a):
+    _combat["state"] = None
+    _combat["slot_map"] = {}
+    _combat["unit_hp"] = {}
+    return {"stopped": True}
+
+def _combat_slots(w):
+    s = _combat.get("slots")
+    if s:
+        s = [a for a in s if unreal.SystemLibrary.is_valid(a)]
+    if not s:
+        s = []
+        try:
+            for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.StaticMeshActor):
+                try:
+                    if a.get_actor_label().startswith(_ENEMY_SLOT_PREFIX):
+                        s.append(a)
+                except Exception:
+                    pass
+            s.sort(key=lambda a: a.get_actor_label())
+        except Exception:
+            pass
+    _combat["slots"] = s
+    return s
+
+def _combat_enemy_gz(w, eid, x, y):
+    """Zemin z onbellekli: her karede 16 line-trace atmamak icin 400 birim
+    hareketten sonra yeniden olculur."""
+    c = _combat["gz"].get(eid)
+    if c is not None:
+        cx, cy, cz = c
+        if (x - cx) ** 2 + (y - cy) ** 2 < 400.0 ** 2:
+            return cz
+    z = _pie_ground(w, x, y)
+    _combat["gz"][eid] = (x, y, z)
+    return z
+
+def _combat_tick(w, dt):
+    st = _combat["state"]
+    if st is None or wc is None or wg is None or dt <= 0:
+        return
+    if st["phase"] in ("won", "lost"):
+        return
+    # savunmacilar: kayitli Tower/Castle binalari + sahadaki birimler
+    defenders = []
+    for b in wg.placed_buildings:
+        if isinstance(b, dict) and b.get("type") in ("Tower", "Castle"):
+            bdef = wg.BUILDING_DEFS.get(b["type"], {})
+            defenders.append({"id": b.get("label", "tower"), "x": float(b["x"]), "y": float(b["y"]),
+                              "attack": float(bdef.get("damage", 20)),
+                              "range": float(bdef.get("range", 2000)),
+                              "hp": None, "kind": "tower"})
+    units = {}
+    for uac in _pie_units(w):
+        lbl = uac.get_actor_label()
+        utype = next((u for u in wg.UNIT_DEFS if u in lbl), None)
+        if not utype:
+            continue
+        ud = wg.UNIT_DEFS[utype]
+        hp = _combat["unit_hp"].setdefault(lbl, float(ud.get("health", 60)))
+        if hp <= 0:
+            continue
+        loc = uac.get_actor_location()
+        units[lbl] = uac
+        defenders.append({"id": lbl, "x": float(loc.x), "y": float(loc.y),
+                          "attack": float(ud.get("attack", 5)),
+                          "range": float(ud.get("range", 150)),
+                          "hp": hp, "kind": "unit"})
+    events = wc.sim_tick(st, defenders, dt)
+    for ev in events:
+        try:
+            if ev[0] == "unit_hit":
+                _, uid, dmg = ev
+                _combat["unit_hp"][uid] = _combat["unit_hp"].get(uid, 0.0) - dmg
+                if _combat["unit_hp"][uid] <= 0:
+                    ua = units.get(uid)
+                    if ua is not None:
+                        try:
+                            ua.set_actor_hidden_in_game(True)
+                        except Exception:
+                            pass
+                    _pie["orders"].pop(uid, None)
+                    _pie_hint(w, f"BIRIM DUSTU: {uid}", 2.5)
+            elif ev[0] == "die":
+                _, eid, kind, reward = ev
+                wg.earn({"gold": reward})
+                slot = _combat["slot_map"].pop(eid, None)
+                _combat["gz"].pop(eid, None)
+                if slot is not None:
+                    try:
+                        slot.set_actor_hidden_in_game(True)
+                    except Exception:
+                        pass
+            elif ev[0] == "wave_clear":
+                _, wv, bonus = ev
+                wg.earn({"gold": bonus})
+                _pie_hint(w, f"DALGA {wv} SAVUSTURULDU! +{bonus} altin bonus", 4.0)
+            elif ev[0] == "wave_start":
+                _pie_hint(w, f"DALGA {ev[1]} GELIYOR!", 3.0)
+            elif ev[0] == "won":
+                _combat["over_msg"] = True
+                _pie_hint(w, f"ZAFER! {wc.WAVES_TO_WIN} dalga savusturuldu. Altin: +{st['gold_earned']}")
+            elif ev[0] == "lost":
+                _combat["over_msg"] = True
+                _pie_hint(w, f"KOY DUSTU... (dalga {st['wave']}, {st['kills']} kill)")
+        except Exception:
+            pass
+    # dusman aktorlerini esitle
+    try:
+        used = set(_combat["slot_map"].values())
+        pool = [s for s in _combat_slots(w) if s not in used]
+        for eid, e in st["enemies"].items():
+            slot = _combat["slot_map"].get(eid)
+            if slot is None or not unreal.SystemLibrary.is_valid(slot):
+                if not pool:
+                    continue
+                slot = pool.pop(0)
+                _combat["slot_map"][eid] = slot
+                try:
+                    slot.set_actor_hidden_in_game(False)
+                    if e["kind"] == "Brute":
+                        slot.set_actor_scale3d(unreal.Vector(1.35, 1.35, 1.35))
+                    else:
+                        slot.set_actor_scale3d(unreal.Vector(1.0, 1.0, 1.0))
+                except Exception:
+                    pass
+            gz = _combat_enemy_gz(w, eid, e["x"], e["y"])
+            import math as _m
+            yw = _m.degrees(_m.atan2(st["town_y"] - e["y"], st["town_x"] - e["x"]))
+            try:
+                slot.set_actor_location(unreal.Vector(e["x"], e["y"], gz + 2.0), False, False)
+                slot.set_actor_rotation(unreal.Rotator(0, 0, yw), False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # HUD satiri (insa/yol modu aciksa dokunma)
+    _combat["hud_t"] -= dt
+    if _combat["hud_t"] <= 0 and not _pie["build"] and not _pie["road_mode"] and not _combat["over_msg"]:
+        _combat["hud_t"] = 0.5
+        if st["phase"] == "fighting":
+            _pie["hint"] = (f"DALGA {st['wave']}  Dusman:{len(st['enemies'])}  "
+                            f"Kale:{int(st['town_hp'])}/{int(st['town_hp_max'])}")
+        elif st["phase"] == "grace":
+            _pie["hint"] = f"Sonraki dalga: {int(st.get('grace_left', 0))} sn  [N: hemen baslat]"
 
 # ── ASSET ARACLARI (bul / tani / gor / materyal / kopyala-sil) ────────────────
 
@@ -1131,6 +1379,10 @@ TOOLS = {
     "preview_asset":      {"desc": "SEE what a StaticMesh looks like: temp-spawn it far from the village, photograph it via SceneCapture (no viewport/focus needed), clean up. Returns the PNG path immediately.", "fn": tool_preview_asset, "schema": {"type":"object","properties":{"asset_path":{"type":"string"}},"required":["asset_path"]}},
     "create_material_instance": {"desc": "Create a MaterialInstanceConstant from a parent with scalar/vector/texture parameter overrides, saved to disk.", "fn": tool_create_material_instance, "schema": {"type":"object","properties":{"parent":{"type":"string"},"name":{"type":"string"},"folder":{"type":"string","description":"Default /Game/Warden/Materials"},"scalar_params":{"type":"object"},"vector_params":{"type":"object","description":"name -> [r,g,b] or [r,g,b,a]"},"texture_params":{"type":"object","description":"name -> texture asset path"}},"required":["parent","name"]}},
     "asset_ops":          {"desc": "Asset file operations: op = duplicate | rename | delete | exists. duplicate/rename need new_path.", "fn": tool_asset_ops, "schema": {"type":"object","properties":{"op":{"type":"string"},"asset_path":{"type":"string"},"new_path":{"type":"string"}},"required":["op","asset_path"]}},
+    "combat_setup_pool":  {"desc": "One-time editor setup: create the hidden enemy actor pool (copied into PIE). Run once before the first wave.", "fn": tool_combat_setup_pool, "schema": {"type":"object","properties":{"count":{"type":"integer","description":"Pool size, default 24"}}}},
+    "combat_start":       {"desc": "Start the bandit-wave defense loop (Faz A core). wave defaults to 1; radius shrinks spawn distance for quick tests (default 9000).", "fn": tool_combat_start, "schema": {"type":"object","properties":{"wave":{"type":"integer"},"radius":{"type":"number"}}}},
+    "combat_status":      {"desc": "Live combat state: phase, wave, enemies left, TownHall hp, kills, gold earned, unit hp.", "fn": tool_combat_status, "schema": {"type":"object","properties":{}}},
+    "combat_stop":        {"desc": "Stop the combat loop and release enemy actors.", "fn": tool_combat_stop, "schema": {"type":"object","properties":{}}},
 }
 
 # ── GAME TICK ─────────────────────────────────────────────────────────────────
@@ -1960,6 +2212,17 @@ def _pie_tick(dt):
                     _pie_road_enter(w)
             elif _pie_key_edge(_VK_G):
                 _pie_age_up(w)
+            elif _pie_key_edge(0x4E):  # N: dalga baslat / grace'i atla
+                if wc is not None:
+                    stc = _combat["state"]
+                    if stc is None:
+                        try:
+                            TOOLS["combat_start"]["fn"]({})
+                            _pie_hint(w, "DALGA 1 GELIYOR! (N ile baslatildi)", 3.0)
+                        except Exception as e:
+                            _pie_hint(w, f"Savas baslamadi: {e}", 3.0)
+                    elif stc["phase"] == "grace":
+                        stc["grace_left"] = 0.1
             elif _pie_key_edge(_VK_ESC):
                 if _pie["build"]:
                     _pie_build_exit(w)
@@ -2033,6 +2296,11 @@ def _pie_tick(dt):
         ac.set_actor_rotation(unreal.Rotator(0, 0, yaw), False)
     for lbl in done:
         _pie["orders"].pop(lbl, None)
+    # savas dongusu (dusman dalgalari)
+    try:
+        _combat_tick(w, dt)
+    except Exception as e:
+        unreal.log(f"[combat] err: {e}")
 
 # ── MAIN-THREAD EXECUTOR ───────────────────────────────────────────────────────
 

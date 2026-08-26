@@ -92,6 +92,10 @@ That same tick callback also drives the game simulation, the camera, unit moveme
 | `spend_resources` | Deduct an arbitrary cost dict |
 | `set_wall_age` | Swap the village wall era, palisade (age 1) to stone (age 2), by hiding sets rather than destroying them |
 | `import_building_glb` | Import a GLB and re-skin every actor of a building type, auto-scaling to the previous footprint |
+| `combat_setup_pool` | One-time setup: hidden enemy actor pool, copied into PIE (actors cannot be spawned inside a running PIE from editor Python) |
+| `combat_start` / `combat_status` / `combat_stop` | Drive the bandit-wave defense loop and read its live state |
+
+The wave-defense simulation itself lives in `warden_combat.py` as pure Python with no `unreal` import: it runs and self-tests offline, and the editor layer only feeds it defender positions and applies its event stream (move, hit, die, wave clear, win/lose) to actors and the HUD.
 
 The rules live on the server, not in the prompt. `build_building` refuses a placement that is not next to a road, and `spawn_unit` refuses when population is short. An agent cannot talk its way past them.
 
@@ -107,6 +111,8 @@ Content/Python/init_unreal.py   MCP server, tool registry, thread bridge, PIE la
 Content/Python/warden_game.py   Domain model imported by the server: building and unit
                                 definitions, costs, resource and population state, and
                                 the production rules the game tools enforce.
+Content/Python/warden_combat.py Wave-defense simulation, pure Python (no unreal import),
+                                deterministic, self-testing when run directly.
 proxy/warden_mcp_proxy.py       stdio to HTTP bridge for the MCP client.
 proxy/warden_mcp.cmd            Launcher, runs the bridge on Unreal's bundled Python.
 Config/DefaultEditorPerProjectUserSettings.ini

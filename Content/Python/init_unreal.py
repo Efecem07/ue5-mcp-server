@@ -608,10 +608,29 @@ def _scene_capture_png(world, loc, rot, name, w=1280, h=720, fov=90.0):
     Editor arka planda/odaksizken de calisir (HighResShot orada dosya uretmez)."""
     rt = unreal.RenderingLibrary.create_render_target2d(
         world, int(w), int(h), unreal.TextureRenderTargetFormat.RTF_RGBA8)
-    kls = unreal.load_class(None, "/Script/Engine.SceneCapture2D")
-    cap = unreal.EditorLevelLibrary.spawn_actor_from_class(kls, loc, rot)
+    # PIE'de editor dunyasina spawn YAPILAMAZ; level'da hazir duran
+    # WARDEN_CaptureCam aktoru (PIE'ye kopyalanir) varsa onu tasiyip kullan.
+    cap = None
+    spawned = False
+    try:
+        for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.SceneCapture2D):
+            try:
+                if a.get_actor_label() == "WARDEN_CaptureCam":
+                    cap = a
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if cap is not None:
+        cap.set_actor_location(loc, False, False)
+        cap.set_actor_rotation(rot, False)
+    else:
+        kls = unreal.load_class(None, "/Script/Engine.SceneCapture2D")
+        cap = unreal.EditorLevelLibrary.spawn_actor_from_class(kls, loc, rot)
+        spawned = True
     if not cap:
-        raise Exception("SceneCapture2D spawn olmadi")
+        raise Exception("SceneCapture2D yok: PIE icin once WARDEN_CaptureCam aktorunu kur")
     try:
         cc = cap.capture_component2d
         cc.set_editor_property("texture_target", rt)
@@ -625,10 +644,11 @@ def _scene_capture_png(world, loc, rot, name, w=1280, h=720, fov=90.0):
             raise Exception(f"Export dosya uretmedi: {p}")
         return p
     finally:
-        try:
-            unreal.EditorLevelLibrary.destroy_actor(cap)
-        except Exception:
-            pass
+        if spawned:
+            try:
+                unreal.EditorLevelLibrary.destroy_actor(cap)
+            except Exception:
+                pass
 
 def tool_screenshot(a):
     name = a.get("name", "warden_shot.png")
@@ -1087,9 +1107,12 @@ def _combat_tick(w, dt):
                               "range": float(bdef.get("range", 2000)),
                               "hp": None, "kind": "tower"})
     units = {}
+    militia = _combat.setdefault("militia", set())
     for uac in _pie_units(w):
         lbl = uac.get_actor_label()
         utype = next((u for u in wg.UNIT_DEFS if u in lbl), None)
+        if lbl in militia:
+            utype = "Militia"
         if not utype:
             continue
         ud = wg.UNIT_DEFS[utype]
@@ -1101,7 +1124,9 @@ def _combat_tick(w, dt):
         defenders.append({"id": lbl, "x": float(loc.x), "y": float(loc.y),
                           "attack": float(ud.get("attack", 5)),
                           "range": float(ud.get("range", 150)),
-                          "hp": hp, "kind": "unit"})
+                          "hp": hp, "kind": "unit",
+                          "speed": float(ud.get("speed", 280)),
+                          "fighter": utype != "Peasant"})
     events = wc.sim_tick(st, defenders, dt)
     for ev in events:
         try:
@@ -1170,6 +1195,41 @@ def _combat_tick(w, dt):
                 pass
     except Exception:
         pass
+    # otomatik savunma: asker sinifi birim (koylu HARIC) emirsizse en yakin
+    # dusmani kovalar; oyuncunun verdigi emir ezilmez, yalniz bizim
+    # verdigimiz otomatik emirler guncellenir/temizlenir.
+    _combat["chase_t"] = _combat.get("chase_t", 0.0) - dt
+    if _combat["chase_t"] <= 0 and st["phase"] == "fighting":
+        _combat["chase_t"] = 0.5
+        auto = _combat.setdefault("auto_orders", set())
+        for d in defenders:
+            if d["kind"] != "unit" or not d.get("fighter"):
+                continue
+            lbl = d["id"]
+            ua = units.get(lbl)
+            if ua is None:
+                auto.discard(lbl)
+                continue
+            best, bd = None, 2200.0
+            for e in st["enemies"].values():
+                dd = ((d["x"] - e["x"]) ** 2 + (d["y"] - e["y"]) ** 2) ** 0.5
+                if dd < bd:
+                    bd, best = dd, e
+            has_order = lbl in _pie["orders"]
+            if best is None or bd <= d["range"] * 0.8:
+                # dusman yok ya da zaten vurus menzilinde: bizim emri kaldir, dur
+                if lbl in auto and has_order:
+                    _pie["orders"].pop(lbl, None)
+                auto.discard(lbl)
+                continue
+            if (not has_order) or lbl in auto:
+                try:
+                    ua.root_component.set_mobility(unreal.ComponentMobility.MOVABLE)
+                except Exception:
+                    pass
+                _pie["orders"][lbl] = {"actor": ua, "path": [(best["x"], best["y"])],
+                                      "speed": d.get("speed", 280.0)}
+                auto.add(lbl)
     # HUD satiri (insa/yol modu aciksa dokunma)
     _combat["hud_t"] -= dt
     if _combat["hud_t"] <= 0 and not _pie["build"] and not _pie["road_mode"] and not _combat["over_msg"]:
@@ -2120,6 +2180,19 @@ def _pie_tick(dt):
                 unreal.log(f"[PIE] sur cagi kalici: {age_v}")
             except Exception as e:
                 unreal.log(f"[PIE] age replay err: {e}")
+        # savas temizligi: PIE aktoru referanslari oldu, birim canlari tazelenir;
+        # milis donusumu geciciydi, duser. Biten savas (won/lost) tamamen sifirlanir.
+        if _combat.get("unit_hp") or _combat.get("slot_map") or _combat.get("militia"):
+            _combat["slot_map"] = {}
+            _combat["slots"] = None
+            _combat["gz"] = {}
+            _combat["unit_hp"] = {}
+            _combat.setdefault("militia", set()).clear()
+            _combat.setdefault("auto_orders", set()).clear()
+            _combat["over_msg"] = False
+            stx = _combat.get("state")
+            if stx is not None and stx.get("phase") in ("won", "lost"):
+                _combat["state"] = None
         if _pie["sel"] is not None or _pie["orders"] or _pie["cursor"]:
             _pie["sel"] = None
             _pie["orders"].clear()
@@ -2223,6 +2296,33 @@ def _pie_tick(dt):
                             _pie_hint(w, f"Savas baslamadi: {e}", 3.0)
                     elif stc["phase"] == "grace":
                         stc["grace_left"] = 0.1
+            elif _pie_key_edge(0x4D):  # M: secili koyluyu milise donustur (gecici)
+                sel = _pie["sel"]
+                mil = _combat.setdefault("militia", set())
+                if sel is None or not unreal.SystemLibrary.is_valid(sel):
+                    _pie_hint(w, "Once bir koylu sec (sol tik), sonra M.", 2.5)
+                elif "Peasant" not in sel.get_actor_label():
+                    _pie_hint(w, "Sadece koylu milise donusur.", 2.5)
+                elif sel.get_actor_label() in mil:
+                    _pie_hint(w, "Bu koylu zaten milis.", 2.0)
+                elif wg is not None:
+                    mdef = wg.UNIT_DEFS.get("Militia", {})
+                    ok, msg = wg.spend(mdef.get("cost", {}))
+                    if not ok:
+                        cst = " ".join(f"{k}:{v}" for k, v in mdef.get("cost", {}).items())
+                        _pie_hint(w, f"OLMAZ: {msg}  (Milis bedeli: {cst})", 2.5)
+                    else:
+                        lbl = sel.get_actor_label()
+                        mil.add(lbl)
+                        _combat["unit_hp"].pop(lbl, None)  # milis statlariyla tam can
+                        try:
+                            mmat = _pie_asset("/Game/Warden/Materials/MI_Barracks")
+                            for comp in sel.get_components_by_class(unreal.StaticMeshComponent):
+                                for si in range(comp.get_num_materials()):
+                                    comp.set_material(si, mmat)
+                        except Exception:
+                            pass
+                        _pie_hint(w, f"MILIS SILAHLANDI! ({len(mil)} milis)", 2.5)
             elif _pie_key_edge(_VK_ESC):
                 if _pie["build"]:
                     _pie_build_exit(w)
@@ -2248,7 +2348,7 @@ def _pie_tick(dt):
                     if p is not None:
                         sel = _pie_select_at(w, p.x, p.y)
                         if sel is not None:
-                            _pie_hint(w, f"SECILI: {sel.get_actor_label()}  [SagTik hareket | B insa | Y yol]")
+                            _pie_hint(w, f"SECILI: {sel.get_actor_label()}  [SagTik hareket | M milis | B insa | Y yol]")
                         else:
                             _pie_hint(w, "")
                 elif pc.was_input_key_just_pressed(_pie_key("RightMouseButton")):

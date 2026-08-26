@@ -456,6 +456,15 @@ UNIT_DEFS = {
         "pop_cost": 1,
         "description": "Köylü. Kaynak toplar.",
     },
+    "Militia": {
+        # Kalıcı birim değil: PIE'de M tuşuyla köylüden dönüşür, savaş sonunda düşer.
+        "cost":     {"gold": 15, "iron": 5},
+        "health":   90,
+        "attack":   14,
+        "speed":    300,
+        "pop_cost": 1,
+        "description": "Silahlanmış köylü milisi. Geçici savaş birimi.",
+    },
     "Soldier": {
         "cost":     {"food": 50, "gold": 30, "iron": 10},
         "health":   100,

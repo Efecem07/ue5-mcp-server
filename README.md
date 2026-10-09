@@ -17,7 +17,7 @@ Claude Code  ──stdio──▶  warden_mcp_proxy.py  ──HTTP/SSE──▶ 
 
 A few problems make the naive version impossible, and most of the code exists to solve them.
 
-**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threaded by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event for up to 30 seconds, `_process_commands` runs **on the game thread** via `register_slate_post_tick_callback`, takes one command per tick, writes the outcome to a result store and signals the waiter. The HTTP thread then serialises the result. Every one of the 40 tools goes through this path, and a caller that never gets signalled gets a timeout rather than a hung socket.
+**The Unreal Python API is game-thread-only.** Calling `unreal.EditorLevelLibrary.spawn_actor_from_class` from an HTTP worker thread crashes the editor. But an HTTP server is threaded by definition. So requests never touch the API directly: `_queue()` pushes `(id, tool, args, event)` onto a lock-guarded list and blocks on the event for up to 30 seconds, `_process_commands` runs **on the game thread** via `register_slate_post_tick_callback`, takes one command per tick, writes the outcome to a result store and signals the waiter. The HTTP thread then serialises the result. Every one of the 46 tools goes through this path, and a caller that never gets signalled gets a timeout rather than a hung socket.
 
 The same constraint cuts the other way for long operations. A tool body executes *on* the tick, so a tool that waits — for a screenshot file to appear, for Play-In-Editor to boot, run for a while and shut down — would freeze the frame loop and deadlock the very thing it is waiting for. Those tools return a job id immediately instead. A job is a Python generator; `_jobs_tick` advances every running job by one `next()` per slate tick (behind a reentrancy guard, because some engine calls pump the tick from inside), so a job "sleeps" by yielding and the editor keeps rendering. `job_status` polls the result. This is what lets `pie_smoke` express start-PIE → simulate N seconds → screenshot → stop-PIE → report as a single tool call.
 
@@ -84,6 +84,8 @@ That same tick callback also drives the game simulation, the camera, unit moveme
 | Tool | Does |
 |---|---|
 | `get_game_status` | Resources, population, year, food balance |
+| `game_state` | Full game state: resources, population, age, roads, buildings, obstacles, state file path |
+| `set_state` | Patch resources, population, age or year to set up a test scenario |
 | `build_building` | Place a building with its real mesh, after checking cost **and** the road-adjacency rule |
 | `add_road` | Lay a dirt road along waypoints, priced per 100 units |
 | `spawn_unit` | Peasant / Soldier / Archer / Knight / Siege, checked against resources and population |
@@ -93,6 +95,8 @@ That same tick callback also drives the game simulation, the camera, unit moveme
 | `set_wall_age` | Swap the village wall era, palisade (age 1) to stone (age 2), by hiding sets rather than destroying them |
 | `import_building_glb` | Import a GLB and re-skin every actor of a building type, auto-scaling to the previous footprint |
 | `combat_setup_pool` | One-time setup: hidden enemy actor pool, copied into PIE (actors cannot be spawned inside a running PIE from editor Python) |
+| `unit_pool_setup` | One-time setup: hidden soldier slot pool that the in-game T key activates |
+| `nav_scan_fences` | Turn fence decor into movement blockers so units walk around fences, leaving gaps open |
 | `combat_start` / `combat_status` / `combat_stop` | Drive the bandit-wave defense loop and read its live state |
 
 The wave-defense simulation itself lives in `warden_combat.py` as pure Python with no `unreal` import: it runs and self-tests offline, and the editor layer only feeds it defender positions and applies its event stream (move, hit, die, wave clear, win/lose) to actors and the HUD.

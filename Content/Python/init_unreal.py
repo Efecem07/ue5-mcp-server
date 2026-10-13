@@ -1,5 +1,5 @@
 """
-Warden MCP Server v2 - SSE destekli, Claude Code ile tam uyumlu
+Warden MCP Server v2 - SSE destekli, stdio MCP istemcileriyle tam uyumlu
 Port: 9876
 """
 

@@ -5,7 +5,7 @@ An MCP server that runs **inside the Unreal Engine 5 Editor process**, exposing 
 Written for Warden, an RTS prototype built in UE 5.8. The editor half is generic and works on any UE5 project; the game half is included as a worked example of building a domain layer on top.
 
 ```
-Claude Code  ──stdio──▶  warden_mcp_proxy.py  ──HTTP/SSE──▶  UE5 Editor
+AI client    ──stdio──▶  warden_mcp_proxy.py  ──HTTP/SSE──▶  UE5 Editor
  (MCP client)             (bridge process)      port 9876     init_unreal.py
                                                               │
                                                     slate post-tick pump
@@ -25,7 +25,7 @@ The same constraint cuts the other way for long operations. A tool body executes
 
 That same tick callback also drives the game simulation, the camera, unit movement and the in-editor play layer. Each of those is wrapped in its own `try/except` for a reason that cost a debugging session: one unhandled exception anywhere in the chain makes Unreal drop the entire slate callback, silently, and everything downstream stops ticking with no error in the log.
 
-**Claude Code speaks stdio MCP, and UE5 cannot own stdin.** The editor is a long-lived GUI process; it has no stdio channel to hand to an MCP client. So a thin proxy sits in between. The part that matters: the proxy answers `initialize` and `tools/list` **locally, from a static table**, swallows notifications, and forwards everything else, `tools/call` included, over HTTP. The practical effect is that the toolset shows up in the client even when Unreal is closed, and starting the editor is enough to make those tools callable. Without this, the client would fail its initialization handshake whenever the editor was not already running.
+**MCP clients speak stdio, and UE5 cannot own stdin.** The editor is a long-lived GUI process; it has no stdio channel to hand to an MCP client. So a thin proxy sits in between. The part that matters: the proxy answers `initialize` and `tools/list` **locally, from a static table**, swallows notifications, and forwards everything else, `tools/call` included, over HTTP. The practical effect is that the toolset shows up in the client even when Unreal is closed, and starting the editor is enough to make those tools callable. Without this, the client would fail its initialization handshake whenever the editor was not already running.
 
 ## Tools
 
